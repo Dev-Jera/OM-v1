@@ -16,7 +16,17 @@ vector_store:
   collection: old_mutual_chunks
   # pgvector: uses DATABASE_URL from environment
   # qdrant_local: path: data/qdrant
-  # qdrant_http: host/port below
+  # qdrant_http: host/port below (local/docker-compose)
+  #
+  # Hosted overrides (set as env vars, no YAML edits needed):
+  #   RAG_VECTOR_PROVIDER  -> vector_store.provider
+  #   QDRANT_URL           -> e.g. https://xxx.<region>.cloud.qdrant.io (Qdrant Cloud)
+  #   QDRANT_API_KEY       -> Qdrant Cloud API key
+  #   QDRANT_COLLECTION    -> vector_store.collection
+  #   QDRANT_HOST / QDRANT_PORT -> vector_store.host / vector_store.port
+  #
+  # To switch providers at runtime: RAG_VECTOR_PROVIDER=pgvector (uses DATABASE_URL)
+  # or RAG_VECTOR_PROVIDER=qdrant_http (uses QDRANT_URL + QDRANT_API_KEY).
   host: qdrant
   port: 6333
 

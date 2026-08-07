@@ -23,8 +23,20 @@ class QdrantVectorStore:
         return cls(collection=collection, client=client)
 
     @classmethod
-    def from_http(cls, *, collection: str, host: str, port: int) -> "QdrantVectorStore":
-        client = QdrantClient(host=host, port=port)
+    def from_http(
+        cls,
+        *,
+        collection: str,
+        host: str = "localhost",
+        port: int = 6333,
+        url: str | None = None,
+        api_key: str | None = None,
+    ) -> "QdrantVectorStore":
+        if url:
+            # Qdrant Cloud / HTTPS endpoint: QdrantClient(url=..., api_key=...)
+            client = QdrantClient(url=url, api_key=api_key)
+        else:
+            client = QdrantClient(host=host, port=port, api_key=api_key, https=bool(api_key))
         return cls(collection=collection, client=client)
 
     def ensure_collection(self, vector_size: int) -> None:

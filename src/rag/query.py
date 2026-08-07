@@ -106,7 +106,13 @@ def _vector_store_from_config(cfg: RAGConfig):
         port = cfg.vector_store.port or 6333
         if path:
             return QdrantVectorStore.from_local_path(collection=coll, path=path)
-        return QdrantVectorStore.from_http(collection=coll, host=host, port=port)
+        return QdrantVectorStore.from_http(
+            collection=coll,
+            host=host,
+            port=port,
+            url=cfg.vector_store.url,
+            api_key=cfg.vector_store.api_key,
+        )
     raise ValueError(f"Unknown vector_store.provider: {cfg.vector_store.provider}")
 
 
