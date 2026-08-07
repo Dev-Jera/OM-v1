@@ -1,0 +1,145 @@
+openapi: 3.0.0
+info:
+  title: Insurance API
+  version: 1.0.0
+  description: API for Personal Accident, Serenicare, and Motor Private underwriting and quotation
+
+paths:
+  /underwriting/personal-accident:
+    post:
+      summary: Underwrite Personal Accident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonalAccidentData'
+      responses:
+        '200':
+          description: Underwriting result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnderwritingResult'
+
+  /underwriting/serenicare:
+    post:
+      summary: Underwrite Serenicare
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SerenicareData'
+      responses:
+        '200':
+          description: Underwriting result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnderwritingResult'
+
+  /underwriting/motor-private:
+    post:
+      summary: Underwrite Motor Private
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MotorPrivateData'
+      responses:
+        '200':
+          description: Underwriting result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnderwritingResult'
+
+  /quotation:
+    post:
+      summary: Get Quotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuotationRequest'
+      responses:
+        '200':
+          description: Quotation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotationResult'
+
+components:
+  schemas:
+    PersonalAccidentData:
+      type: object
+      properties:
+        personal_details:
+          type: object
+        next_of_kin:
+          type: object
+        coverage_plan:
+          type: object
+    SerenicareData:
+      type: object
+      properties:
+        about_you:
+          type: object
+        cover_personalization:
+          type: object
+        medical_conditions:
+          type: object
+    MotorPrivateData:
+      type: object
+      properties:
+        about_you:
+          type: object
+        vehicle_details:
+          type: object
+    UnderwritingResult:
+      type: object
+      properties:
+        risk_score:
+          type: number
+        status:
+          type: string
+        summary:
+          type: object
+    QuotationRequest:
+      type: object
+      properties:
+        sum_assured:
+          type: number
+        policy_term:
+          type: number
+        date_of_birth:
+          type: string
+        health_info:
+          type: object
+        lifestyle_info:
+          type: object
+    QuotationResult:
+      type: object
+      properties:
+        product_name:
+          type: string
+        sum_assured:
+          type: number
+        policy_term:
+          type: number
+        monthly_premium:
+          type: number
+        annual_premium:
+          type: number
+        total_over_term:
+          type: number
+        breakdown:
+          type: object
+        features:
+          type: array
+          items:
+            type: string

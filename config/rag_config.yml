@@ -1,0 +1,35 @@
+# RAG pipeline configuration (embeddings, vector store, retrieval, generation)
+# Vector store provider: pgvector (Neon/Postgres) or qdrant_* (local/remote Qdrant)
+# If you change the embedder (e.g. 384-dim -> 3072-dim), run:
+#   python scripts/recreate_vector_table.py --yes && python scripts/generate_embeddings.py
+
+embeddings:
+  provider: gemini  # sentence_transformers | openai | gemini | ollama
+  model: models/gemini-embedding-001
+  output_dimensionality: 1536  # keep <= 2000 for pgvector ivfflat index; 768/1536/3072 supported
+  # For OpenAI: model: text-embedding-3-small
+  # For Gemini: models/gemini-embedding-001; use output_dimensionality 1536 for pgvector
+  # For Ollama: model: nomic-embed-text, base_url: http://localhost:11434
+
+vector_store:
+  provider: qdrant_http   # pgvector | qdrant_local | qdrant_http
+  collection: old_mutual_chunks
+  # pgvector: uses DATABASE_URL from environment
+  # qdrant_local: path: data/qdrant
+  # qdrant_http: host/port below
+  host: qdrant
+  port: 6333
+
+retrieval:
+  top_k: 5   # fetch more chunks so product-specific queries (e.g. Somesa Plan) get relevant context
+  hybrid:
+    enabled: true
+    dense_weight: 0.7
+    sparse_weight: 0.3
+
+generation:
+  enabled: true
+  backend: gemini
+  # If you see "free_tier ... limit: 0", enable billing in Google AI Studio for this project
+  model: "gemini-2.5-flash"
+  api_key_env: GEMINI_API_KEY

@@ -1,0 +1,6 @@
+# Flake8 config (used by CI)
+[flake8]
+max-line-length = 160
+extend-ignore = E203
+per-file-ignores =
+    src/api/main.py:E402

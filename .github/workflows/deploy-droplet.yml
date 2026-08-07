@@ -1,0 +1,36 @@
+name: Deploy to Droplet
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-droplet-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy over SSH
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Deploy on droplet
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          port: 22
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/rag
+            git fetch origin main
+            git checkout main
+            # Ensure local tracked edits on the droplet do not block pull-based deploys.
+            git restore --source=HEAD --staged --worktree .
+            # Force deployment state to match remote main, even if local history diverged.
+            git reset --hard origin/main
+            ./scripts/deploy.sh

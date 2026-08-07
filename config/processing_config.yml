@@ -1,0 +1,23 @@
+cleaning:
+  normalize_unicode: true
+  fix_ocr_errors: true
+  normalize_terminology: true
+
+chunking:
+  chunk_size: 768
+  chunk_overlap: 100
+  strategy: semantic
+
+metadata_extraction:
+  enabled: true
+  extract_products: true
+  extract_insurance_types: true
+
+validation:
+  enabled: true
+  min_chunk_length: 50
+  max_chunk_length: 2000
+
+output:
+  format: jsonl
+  create_index: true

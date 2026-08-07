@@ -1,0 +1,2915 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from src.api.escalation import router as escalation_router
+from src.api.endpoints.payments import payments_api
+from src.api.endpoints.policies import policies_api
+from src.api.endpoints.premiums import premiums_api
+import src.api.escalation as escalation_module
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse, Response
+from fastapi import Request
+api_router = APIRouter()
+"""
+FastAPI application - Main entry point
+"""
+
+import json
+import logging
+import os
+import re
+import asyncio
+from difflib import get_close_matches
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, Optional
+from collections import defaultdict, Counter
+from contextlib import suppress
+
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ValidationError
+from src.chatbot.dependencies import (
+    admin_auth_protection,
+    api_key_protection,
+    authenticate_admin_credentials,
+    create_admin_access_token,
+    verify_admin_access_token,
+)
+
+from src.chatbot.modes.conversational import ConversationalMode
+from src.chatbot.modes.guided import GuidedMode
+from src.chatbot.product_cards import ProductCardGenerator
+from src.chatbot.router import ChatRouter
+from src.chatbot.flows.registry import get_flow_steps
+from src.chatbot.state_manager import StateManager
+from src.chatbot.validation import FormValidationError
+from src.chatbot.brain import ConversationalBrain
+from src.rag.generate import MiaGenerator
+from src.rag.query import retrieve_context
+from src.utils.product_matcher import ProductMatcher
+from src.utils.rag_config_loader import load_rag_config
+from src.utils.runtime_env import runtime_service_summary, should_use_real_postgres, should_use_real_redis
+from src.utils.pii_redaction import redact_text
+from src.api.validate_flow import router as validate_flow_router
+from src.integrations.quote_downloads import get_quote_metadata, get_quote_pdf
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Old Mutual Chatbot API",
+    description="AI-powered insurance chatbot with conversational and guided modes",
+    version="1.0.0",
+    dependencies=[Depends(api_key_protection)],  # protect everything by default
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================================
+# DEPENDENCY INJECTION
+# ============================================================================
+
+# Initialize databases: use real Postgres/Redis when env is set and reachable,
+# otherwise fall back to in-memory stubs for local development.
+if should_use_real_postgres():
+    from src.database.postgres_real import PostgresDB
+
+    postgres_db = PostgresDB(connection_string=os.environ["DATABASE_URL"])
+else:
+    from src.database.postgres import PostgresDB
+
+    postgres_db = PostgresDB()
+
+if should_use_real_redis():
+    from src.database.redis_real import RedisCache
+
+    redis_cache = RedisCache(url=os.environ["REDIS_URL"])
+else:
+    from src.database.redis import RedisCache
+
+    redis_cache = RedisCache()
+
+state_manager = StateManager(redis_cache, postgres_db)
+
+escalation_module.state_manager = state_manager
+# Register escalation router
+app.include_router(escalation_router, prefix="/api/v1")
+
+# Register payments API router
+app.include_router(payments_api, prefix="/api/v1/payments", tags=["Payments"])
+# Register policies API router
+app.include_router(policies_api, prefix="/api/v1/policies", tags=["Policies"])
+
+# Register premiums API router
+app.include_router(premiums_api, prefix="/api/v1/premiums", tags=["Premiums"])
+
+# Register flow validation endpoints (per-field and per-step)
+app.include_router(validate_flow_router, prefix="/api/v1", tags=["Flow Validation"])
+
+product_matcher = ProductMatcher()
+
+# Load RAG configuration once per process
+rag_cfg = load_rag_config()
+
+HEARTBEAT_METRIC_TYPE = "service_heartbeat"
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _heartbeat_interval_seconds() -> int:
+    raw = (os.getenv("SERVICE_HEARTBEAT_INTERVAL_SECONDS") or "").strip()
+    try:
+        value = int(raw)
+        return value if value > 0 else 300
+    except (TypeError, ValueError):
+        return 300
+
+
+def _heartbeat_enabled() -> bool:
+    return _env_bool("SERVICE_HEARTBEAT_ENABLED", default=True)
+
+
+async def _service_heartbeat_loop(stop_event: asyncio.Event):
+    interval_seconds = _heartbeat_interval_seconds()
+    while not stop_event.is_set():
+        try:
+            if hasattr(postgres_db, "add_rag_metric"):
+                postgres_db.add_rag_metric(metric_type=HEARTBEAT_METRIC_TYPE, value=1.0, conversation_id=None)
+        except Exception as exc:
+            logger.warning("Failed to emit service heartbeat metric: %s", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
+
+
+class APIRAGAdapter:
+    """
+    Thin async-compatible wrapper around the existing RAG query pipeline.
+    """
+
+    def __init__(self):
+        self.cfg = rag_cfg
+        # For pgvector, ensure the vector table exists once at startup using the
+        # configured embedding dimensionality, instead of running DDL on every
+        # request inside the hot retrieval path.
+        try:
+            from src.rag.query import _vector_store_from_config as _vs_from_cfg  # type: ignore
+
+            store = _vs_from_cfg(self.cfg)
+            store_class = type(store).__name__
+            if store_class == "PgVectorStore" and hasattr(store, "ensure_table"):
+                # Use the configured output dimensionality when available; fall
+                # back to a sane default if not set.
+                dim = getattr(self.cfg.embeddings, "output_dimensionality", None) or 1536
+                store.ensure_table(int(dim))
+        except Exception as e:  # pragma: no cover - best effort safeguard
+            logger.warning("Failed to pre-initialize vector table: %s", e)
+
+    async def retrieve(self, query: str, filters: Optional[Dict] = None, top_k: Optional[int] = None):
+        k = self.cfg.retrieval.top_k if top_k is None else top_k
+        return retrieve_context(question=query, cfg=self.cfg, top_k=k, filters=filters)
+
+    async def generate(self, query: str, context_docs: List[Dict], conversation_history: List[Dict]):
+        """
+        Use the configured generation backend (Gemini by default) to
+        produce an answer grounded in the retrieved context.
+        """
+        def _retrieval_stats() -> Dict[str, float]:
+            if not context_docs:
+                return {"avg_score": 0.0, "coverage": 0.0}
+            scores = [float(h.get("score") or 0.0) for h in context_docs]
+            avg_score = sum(scores) / len(scores) if scores else 0.0
+            coverage = min(len(context_docs) / 5.0, 1.0)
+            return {"avg_score": avg_score, "coverage": coverage}
+
+        def _compute_confidence() -> float:
+            stats = _retrieval_stats()
+            avg_score = stats["avg_score"]
+            coverage = stats["coverage"]
+            min_score = 0.55
+            # Normalize avg_score into 0..1 confidence band.
+            if avg_score <= 0:
+                score_norm = 0.0
+            else:
+                score_norm = (avg_score - min_score) / max(1.0 - min_score, 0.01)
+                score_norm = max(0.0, min(1.0, score_norm))
+            conf = (0.7 * score_norm) + (0.3 * coverage)
+            return float(max(0.0, min(1.0, round(conf, 3))))
+
+        def _extractive_answer() -> Dict[str, Any]:
+            """
+            Fallback: build an answer directly from known product chunks when
+            the generator is unavailable or fails.
+            """
+            confidence = _compute_confidence()
+            snippets: List[str] = []
+
+            # 1) Use any text already present on the hits.
+            for h in context_docs:
+                payload = h.get("payload") or {}
+                text = (payload.get("text") or "").strip()
+                if text:
+                    snippets.append(text)
+
+            # 2) If still empty, try structured product sections file by doc_id.
+            if len(snippets) < 1:
+                from typing import Set
+
+                doc_ids: Set[str] = set()
+                for h in context_docs:
+                    p = h.get("payload") or {}
+                    doc_id = p.get("doc_id")
+                    if not doc_id or doc_id in doc_ids:
+                        continue
+                    doc_ids.add(doc_id)
+                    try:
+                        sections = _load_product_sections(doc_id)
+                    except Exception as e:  # pragma: no cover - best-effort only
+                        logger.warning("Failed to load sections for %s: %s", doc_id, e)
+                        continue
+
+                    overview = sections.get("overview") or []
+                    benefits = sections.get("benefits") or []
+
+                    if overview:
+                        ov_text = (overview[0].get("text") or "").strip()
+                        if ov_text:
+                            snippets.append(ov_text)
+
+                    if benefits:
+                        b0 = (benefits[0].get("text") or "").strip()
+                        if b0:
+                            snippets.append(b0)
+
+            # 3) As a last resort, try to resolve individual chunk IDs directly
+            if len(snippets) < 1:
+                try:
+                    chunks_path = Path(__file__).parent.parent.parent / "data" / "processed" / "website_chunks.jsonl"
+                    if chunks_path.exists():
+                        wanted_ids = set()
+                        for h in context_docs:
+                            cid = h.get("id") or (h.get("payload") or {}).get("id")
+                            if cid:
+                                wanted_ids.add(cid)
+
+                        if wanted_ids:
+                            with open(chunks_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    if not line.strip():
+                                        continue
+                                    try:
+                                        data = json.loads(line)
+                                    except Exception:
+                                        continue
+                                    if data.get("id") not in wanted_ids:
+                                        continue
+                                    heading = data.get("section_heading") or ""
+                                    raw_text = data.get("text") or ""
+                                    text = _strip_heading_from_text(raw_text, heading)
+                                    text = (text or "").strip()
+                                    if text:
+                                        snippets.append(text)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("Chunk-id extractive fallback failed: %s", e)
+
+            answer_text = "\n\n".join(snippets).strip() or "I'm not sure based on the available information."
+            return {"answer": answer_text, "confidence": confidence, "sources": context_docs}
+
+        # If generation is globally disabled, always fall back to extractive mode.
+        if not self.cfg.generation.enabled:
+            return _extractive_answer()
+
+        stats = _retrieval_stats()
+        if not context_docs or stats["avg_score"] < 0.55:
+            return _extractive_answer()
+
+        if self.cfg.generation.backend == "gemini":
+            mia = MiaGenerator()
+            try:
+                answer = await mia.generate(query, context_docs, conversation_history)
+            except Exception as e:  # pragma: no cover
+                logger.error("MiaGenerator.generate raised unexpectedly: %s", e, exc_info=True)
+                return _extractive_answer()
+
+            fallback_phrase = "I'm having trouble retrieving those details. Please call 0800-100-900 for immediate help."
+            if not answer or fallback_phrase in answer:
+                return _extractive_answer()
+
+            return {"answer": answer, "confidence": _compute_confidence(), "sources": context_docs}
+
+        return _extractive_answer()
+
+
+rag_adapter = APIRAGAdapter()
+
+# Conversational brain: LLM-driven free-text understanding (tool-call based RAG
+# grounding + quote detection). Auto-disables when the Gemini key is missing.
+conversational_brain = ConversationalBrain(retrieve_fn=rag_adapter.retrieve)
+
+conversational_mode = ConversationalMode(rag_adapter, product_matcher, state_manager, brain=conversational_brain)
+guided_mode = GuidedMode(state_manager, product_matcher, postgres_db)
+chat_router = ChatRouter(conversational_mode, guided_mode, state_manager, product_matcher)
+product_card_gen = ProductCardGenerator(product_matcher, rag_adapter)
+
+
+def get_db():
+    """Dependency for database sessions"""
+    return postgres_db
+
+
+def get_redis():
+    """Dependency for Redis cache"""
+    return redis_cache
+
+
+def get_router():
+    """Dependency for chat router"""
+    return chat_router
+
+
+GENERAL_INFO_ALIASES: Dict[str, str] = {}
+
+
+def _normalize_general_info_key(value: str) -> str:
+    key = (value or "").strip().lower()
+    if not key:
+        return ""
+
+    key = key.replace("\\", "/")
+    key = key.split("?", 1)[0].split("#", 1)[0]
+
+    prefix = "website:product:"
+    if key.startswith(prefix):
+        key = key[len(prefix):]
+
+    key = key.strip("/")
+    if "/" in key:
+        key = key.split("/")[-1]
+
+    key = re.sub(r"[,()/\\\-_]+", " ", key)
+    key = re.sub(r"\s+", " ", key)
+
+    return key.strip()
+
+
+def _general_info_display_name_from_stem(stem: str) -> str:
+    return re.sub(r"[-_]+", " ", (stem or "")).strip()
+
+
+def _general_info_candidate_paths(product: str, product_dir: Path) -> List[Path]:
+    """Return all candidate paths for a given product, sorted by match quality."""
+    normalized = _normalize_general_info_key(product)
+    if not normalized or not product_dir.exists():
+        return []
+
+    candidate_files = sorted(product_dir.glob("*.json"))
+    if not candidate_files:
+        return []
+
+    metadata_cache: Dict[Path, Dict[str, Any]] = {}
+
+    def _load_info(path: Path) -> Dict[str, Any]:
+        if path in metadata_cache:
+            return metadata_cache[path]
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        metadata_cache[path] = data
+        return data
+
+    results = []
+
+    # 1) alias match first
+    alias_target = GENERAL_INFO_ALIASES.get(normalized)
+    if alias_target:
+        alias_path = product_dir / f"{alias_target}.json"
+        if alias_path.exists():
+            results.append(alias_path)
+
+    # 2) exact filename/display-name matches
+    for path in candidate_files:
+        if normalized in {
+            _normalize_general_info_key(path.stem),
+            _normalize_general_info_key(_general_info_display_name_from_stem(path.stem)),
+        }:
+            if path not in results:
+                results.append(path)
+
+    # 3) title/product_id matches from JSON content
+    for path in candidate_files:
+        info = _load_info(path)
+        if normalized in {
+            _normalize_general_info_key(str(info.get("title") or "")),
+            _normalize_general_info_key(str(info.get("product_id") or "")),
+        }:
+            if path not in results:
+                results.append(path)
+
+    # 4) token overlap scoring
+    input_tokens = _general_info_tokens(normalized)
+    scored_paths: List[tuple[Path, tuple[int, float]]] = []
+    if input_tokens:
+        for path in candidate_files:
+            if path in results:
+                continue
+            info = _load_info(path)
+            candidate_tokens = (
+                _general_info_tokens(path.stem)
+                | _general_info_tokens(_general_info_display_name_from_stem(path.stem))
+                | _general_info_tokens(str(info.get("title") or ""))
+                | _general_info_tokens(str(info.get("product_id") or ""))
+            )
+            if not candidate_tokens:
+                continue
+            overlap = len(input_tokens & candidate_tokens)
+            if overlap <= 0:
+                continue
+            coverage = overlap / max(len(input_tokens), 1)
+            score = (overlap, coverage)
+            min_overlap = 2 if len(input_tokens) > 1 else 1
+            if score[0] >= min_overlap and score[1] >= 0.5:
+                scored_paths.append((path, score))
+
+    scored_paths.sort(key=lambda x: x[1], reverse=True)
+    for path, _ in scored_paths:
+        if path not in results:
+            results.append(path)
+
+    # 5) fuzzy match last
+    lookup: Dict[str, Path] = {}
+    for path in candidate_files:
+        if path in results:
+            continue
+        info = _load_info(path)
+        for candidate in (
+            _normalize_general_info_key(path.stem),
+            _normalize_general_info_key(_general_info_display_name_from_stem(path.stem)),
+            _normalize_general_info_key(str(info.get("title") or "")),
+            _normalize_general_info_key(str(info.get("product_id") or "")),
+        ):
+            if candidate and candidate not in lookup:
+                lookup[candidate] = path
+
+    matches = get_close_matches(normalized, list(lookup.keys()), n=len(lookup), cutoff=0.72)
+    for match in matches:
+        path = lookup[match]
+        if path not in results:
+            results.append(path)
+
+    return results
+
+
+def _general_info_tokens(value: str) -> set[str]:
+    stopwords = {"insurance", "plan", "fund", "scheme", "cover", "product"}
+    normalized = _normalize_general_info_key(value)
+    return {token for token in normalized.split() if token and token not in stopwords}
+
+
+def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path]:
+    normalized = _normalize_general_info_key(product)
+    if not normalized or not product_dir.exists():
+        return None
+
+    candidate_files = sorted(product_dir.glob("*.json"))
+    metadata_cache: Dict[Path, Dict[str, Any]] = {}
+
+    def _load_info(path: Path) -> Dict[str, Any]:
+        if path in metadata_cache:
+            return metadata_cache[path]
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        metadata_cache[path] = data
+        return data
+
+    # 1) alias match first
+    alias_target = GENERAL_INFO_ALIASES.get(normalized)
+    if alias_target:
+        alias_path = product_dir / f"{alias_target}.json"
+        if alias_path.exists():
+            return alias_path
+
+    # 2) exact filename/display-name matches
+    for path in candidate_files:
+        if normalized in {
+            _normalize_general_info_key(path.stem),
+            _normalize_general_info_key(_general_info_display_name_from_stem(path.stem)),
+        }:
+            return path
+
+    # 3) title/product_id matches from JSON content
+    for path in candidate_files:
+        info = _load_info(path)
+        if normalized in {
+            _normalize_general_info_key(str(info.get("title") or "")),
+            _normalize_general_info_key(str(info.get("product_id") or "")),
+        }:
+            return path
+
+    # 4) token overlap scoring
+    input_tokens = _general_info_tokens(normalized)
+    best_path: Optional[Path] = None
+    best_score: tuple[int, float] = (0, 0.0)
+    if input_tokens:
+        for path in candidate_files:
+            info = _load_info(path)
+            candidate_tokens = (
+                _general_info_tokens(path.stem)
+                | _general_info_tokens(_general_info_display_name_from_stem(path.stem))
+                | _general_info_tokens(str(info.get("title") or ""))
+                | _general_info_tokens(str(info.get("product_id") or ""))
+            )
+            if not candidate_tokens:
+                continue
+            overlap = len(input_tokens & candidate_tokens)
+            if overlap <= 0:
+                continue
+            coverage = overlap / max(len(input_tokens), 1)
+            score = (overlap, coverage)
+            if score > best_score:
+                best_score = score
+                best_path = path
+
+        min_overlap = 2 if len(input_tokens) > 1 else 1
+        if best_path is not None and best_score[0] >= min_overlap and best_score[1] >= 0.5:
+            return best_path
+
+    # 5) fuzzy match last
+    lookup: Dict[str, Path] = {}
+    for path in candidate_files:
+        info = _load_info(path)
+        for candidate in (
+            _normalize_general_info_key(path.stem),
+            _normalize_general_info_key(_general_info_display_name_from_stem(path.stem)),
+            _normalize_general_info_key(str(info.get("title") or "")),
+            _normalize_general_info_key(str(info.get("product_id") or "")),
+        ):
+            if candidate and candidate not in lookup:
+                lookup[candidate] = path
+
+    matches = get_close_matches(normalized, list(lookup.keys()), n=1, cutoff=0.72)
+    if matches:
+        return lookup[matches[0]]
+
+    return None
+
+
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+from src.chatbot.controllers.motor_private_controller import MOTOR_PRIVATE_VEHICLE_MAKE_OPTIONS
+
+
+class MotorPrivateFullFormRequest(BaseModel):
+    user_id: str = Field(..., description="External user identifier (e.g. phone number)")
+    data: Dict[str, Any] = Field(..., description="Flattened form fields for Motor Private quote")
+
+
+@app.get("/api/v1/motor-private/vehicle-makes", tags=["Motor Private"])
+async def get_motor_private_vehicle_makes():
+    return {"options": MOTOR_PRIVATE_VEHICLE_MAKE_OPTIONS}
+
+
+@app.post("/api/v1/motor-private/calculate-quote", tags=["Motor Private"])
+async def calculate_motor_private_quote(body: MotorPrivateFullFormRequest):
+    """
+    Calculate Motor Private quote using Zoho Deluge formula.
+
+    Expected fields in data:
+    - vehicle_value_ugx: float (minimum 10M, maximum 100M UGX)
+    - car_usage_region: str ("Within Uganda", "Within East Africa", "Outside East Africa")
+    - first_time_registration: str ("Yes"/"No")
+    - car_alarm_installed: str ("Yes"/"No")
+    - tracking_system_installed: str ("Yes"/"No")
+    - selected_benefits: list (["political_violence"], ["alternative_accommodation"], ["car_hire"])
+    - excess_choice: list (["excess_1"], ["excess_2"], ["excess_3"])
+    - cover_start_date: str (ISO date format)
+    - year_of_manufacture: int
+    - first_name, surname, email: str
+    - vehicle_make: str
+    """
+    try:
+        from src.integrations.clients.real_http.motor_private_calculator import calculate_motor_private_premium
+
+        # Calculate premium
+        premium_breakdown = calculate_motor_private_premium(body.data)
+
+        return {
+            "success": True,
+            "premium_breakdown": premium_breakdown,
+            "total_premium": premium_breakdown.get("total"),
+            "message": premium_breakdown.get("message"),
+            "downloadUrl": premium_breakdown.get("downloadUrl"),
+        }
+    except Exception as e:
+        logger.error(f"Error calculating motor private quote: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Quote calculation failed: {str(e)}")
+
+
+class ChatMessage(BaseModel):
+    message: str = ""
+    session_id: Optional[str] = None
+    user_id: str
+    metadata: Optional[Dict] = None
+    form_data: Optional[Dict] = None
+
+
+class ChatResponse(BaseModel):
+    response: Dict
+    session_id: str
+    mode: str
+    timestamp: str
+
+
+class ProductQuotePreviewRequest(BaseModel):
+    user_id: str = Field(..., description="External user identifier (e.g. phone number)")
+    underwriting_data: Dict[str, Any] = Field(..., description="Per-product underwriting/personalization payload")
+    currency: str = Field(default="UGX", description="Currency code")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Optional metadata")
+
+
+class PersonalAccidentFullFormRequest(BaseModel):
+    user_id: str = Field(..., description="External user identifier (e.g. phone number)")
+    data: Dict[str, Any] = Field(..., description="Flattened form fields for Personal Accident application")
+
+
+class PersonalAccidentFullFormResponse(BaseModel):
+    quote_id: str
+    product_name: str
+    monthly_premium: float
+    annual_premium: float
+    sum_assured: float
+    breakdown: Dict[str, Any]
+
+
+class MotorPrivateFullFormResponse(BaseModel):
+    quote_id: str
+    product_name: str
+    total_premium: float
+    breakdown: Dict[str, Any]
+
+
+class TravelInsuranceFullFormRequest(BaseModel):
+    user_id: str = Field(..., description="External user identifier (e.g. phone number)")
+    data: Dict[str, Any] = Field(..., description="Flattened form fields for Travel Insurance application")
+
+
+class TravelInsuranceFullFormResponse(BaseModel):
+    quote_id: str
+    product_name: str
+    total_premium_ugx: float
+    total_premium_usd: float
+    breakdown: Dict[str, Any]
+
+
+class SerenicareFullFormRequest(BaseModel):
+    user_id: str = Field(..., description="External user identifier (e.g. phone number)")
+    data: Dict[str, Any] = Field(..., description="Flattened form fields for Serenicare application")
+
+
+class SerenicareFullFormResponse(BaseModel):
+    quote_id: str
+    product_name: str
+    monthly_premium: float
+    annual_premium: float
+    breakdown: Dict[str, Any]
+
+
+class CreateSessionRequest(BaseModel):
+    user_id: str = Field(..., description="User identifier (e.g. phone number or auth id)")
+
+
+class CreateSessionResponse(BaseModel):
+    session_id: str
+    user_id: str
+
+
+class StartGuidedRequest(BaseModel):
+    flow_name: str = Field(..., description="Flow id, e.g. 'personal_accident'")
+    user_id: str
+    session_id: Optional[str] = None
+    initial_data: Optional[Dict] = Field(default_factory=dict, description="Optional pre-filled data for the flow")
+
+
+class CSATFeedbackRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5, description="CSAT rating from 1 to 5")
+    feedback: Optional[str] = Field(default="", description="Optional user feedback text")
+    session_id: Optional[str] = Field(default=None, description="Chat session id")
+    user_id: Optional[str] = Field(default=None, description="External user id (optional)")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+
+class ChatConsoleReplyRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="Agent reply text")
+    agent_id: Optional[str] = Field(default="agent", description="Agent identifier")
+    sender: Optional[str] = Field(default="agent", description="Reply sender type")
+
+
+class AdminLoginRequest(BaseModel):
+    email: str = Field(..., description="Admin account email")
+    password: str = Field(..., min_length=1, description="Admin account password")
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+
+@app.get("/", tags=["Health"])
+async def root():
+    return {"service": "Old Mutual Chatbot API", "status": "healthy", "version": "1.0.0", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    return {"status": "healthy", "database": {"postgres": "connected", "redis": redis_cache.ping()}, "timestamp": datetime.now().isoformat()}
+
+
+@api_router.post("/auth/login", tags=["Auth"])
+async def admin_login(body: AdminLoginRequest):
+    email = body.email.strip().lower()
+    password = body.password.strip()
+    if not authenticate_admin_credentials(email, password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+
+    token_payload = create_admin_access_token(email)
+    return {**token_payload, "email": email}
+
+
+@api_router.get("/auth/me", tags=["Auth"])
+async def admin_me(claims: Dict[str, Any] = Depends(admin_auth_protection)):
+    exp_raw = claims.get("exp")
+    expires_at = None
+    if isinstance(exp_raw, int) and exp_raw > 0:
+        expires_at = datetime.fromtimestamp(exp_raw, tz=timezone.utc).isoformat()
+    return {"email": claims.get("sub"), "expires_at": expires_at}
+
+
+@api_router.get("/metrics/rag", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+async def get_rag_metrics(
+    limit: int = Query(50, ge=1, le=500),
+    conversation_id: Optional[str] = None,
+    db: PostgresDB = Depends(get_db),
+):
+    metrics = db.get_recent_rag_metrics(limit=limit, conversation_id=conversation_id)
+    return {
+        "count": len(metrics),
+        "metrics": [
+            {
+                "id": m.id,
+                "conversation_id": m.conversation_id,
+                "metric_type": m.metric_type,
+                "value": m.value,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in metrics
+        ],
+    }
+
+
+@api_router.get("/metrics/system-performance", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+async def get_system_performance_metrics(
+    days: int = Query(7, ge=1, le=90),
+    db: PostgresDB = Depends(get_db),
+):
+    """
+    System performance KPIs for the admin dashboard.
+    """
+    now = datetime.utcnow()
+    current_start = now - timedelta(days=days)
+    previous_start = current_start - timedelta(days=days)
+
+    def _rate(numerator: int, denominator: int) -> float:
+        return round((numerator / denominator) * 100, 2) if denominator > 0 else 0.0
+
+    def _delta(current: float, previous: float) -> float:
+        return round(current - previous, 2)
+
+    current_conversations = db.count_conversations(current_start, now)
+    previous_conversations = db.count_conversations(previous_start, current_start)
+    current_escalations = len(
+        db.list_conversation_events(
+            start=current_start,
+            end=now,
+            event_type="escalation_confirmed",
+            limit=50000,
+        )
+    )
+    previous_escalations = len(
+        db.list_conversation_events(
+            start=previous_start,
+            end=current_start,
+            event_type="escalation_confirmed",
+            limit=50000,
+        )
+    )
+
+    escalation_rate = _rate(current_escalations, current_conversations)
+    escalation_rate_prev = _rate(previous_escalations, previous_conversations)
+    escalation_change = _delta(escalation_rate, escalation_rate_prev)
+
+    resolution_rate = _rate(max(current_conversations - current_escalations, 0), current_conversations)
+    resolution_rate_prev = _rate(max(previous_conversations - previous_escalations, 0), previous_conversations)
+    resolution_change = _delta(resolution_rate, resolution_rate_prev)
+
+    current_success = db.count_payment_transactions(current_start, now, ["SUCCESS", "COMPLETED"])
+    current_failed = db.count_payment_transactions(current_start, now, ["FAILED", "ERROR"])
+    previous_success = db.count_payment_transactions(previous_start, current_start, ["SUCCESS", "COMPLETED"])
+    previous_failed = db.count_payment_transactions(previous_start, current_start, ["FAILED", "ERROR"])
+
+    payment_rate = _rate(current_success, current_success + current_failed)
+    payment_rate_prev = _rate(previous_success, previous_success + previous_failed)
+    payment_change = _delta(payment_rate, payment_rate_prev)
+
+    label_suffix = f"vs previous {days} days"
+    return {
+        "kpis": [
+            {
+                "label": "Escalation Rate",
+                "value": f"{escalation_rate:.2f}%",
+                "change": escalation_change,
+                "invertTrend": True,
+                "changeLabel": label_suffix,
+            },
+            {
+                "label": "AI Resolution Rate",
+                "value": f"{resolution_rate:.2f}%",
+                "change": resolution_change,
+                "changeLabel": label_suffix,
+            },
+            {
+                "label": "Payment Success",
+                "value": f"{payment_rate:.2f}%",
+                "change": payment_change,
+                "changeLabel": label_suffix,
+            },
+        ]
+    }
+
+
+@api_router.get("/metrics/ai-performance", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+async def get_ai_performance_metrics(
+    days: int = Query(30, ge=1, le=180),
+    db: PostgresDB = Depends(get_db),
+):
+    """
+    Aggregated AI performance metrics for the admin dashboard.
+    """
+    now = datetime.utcnow()
+    current_start = now - timedelta(days=days)
+    previous_start = current_start - timedelta(days=days)
+
+    def _avg(values: List[float]) -> float:
+        return round(sum(values) / len(values), 4) if values else 0.0
+
+    def _rate(num: int, denom: int) -> float:
+        return round((num / denom) * 100, 2) if denom > 0 else 0.0
+
+    def _delta(curr: float, prev: float) -> float:
+        return round(curr - prev, 2)
+
+    def _fmt_pct(value: float, digits: int = 1) -> str:
+        return f"{value:.{digits}f}%"
+
+    def _fmt_delta(value: float, digits: int = 1) -> str:
+        sign = "+" if value > 0 else ""
+        return f"{sign}{value:.{digits}f}%"
+
+    def _fmt_seconds(value: float) -> str:
+        return f"{value:.1f}s"
+
+    def _fmt_duration(seconds: float) -> str:
+        if seconds <= 0:
+            return "0s"
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        if mins <= 0:
+            return f"{secs}s"
+        return f"{mins}m {secs}s"
+
+    def _pct_change(curr: float, prev: float) -> float:
+        return round(((curr - prev) / prev) * 100, 2) if prev > 0 else 0.0
+
+    def _format_count(value: int) -> str:
+        return f"{value:,}"
+
+    def _safe_non_negative_int(value: Any) -> int:
+        try:
+            parsed = int(value)
+            return parsed if parsed >= 0 else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _window_metrics(start: datetime, end: datetime) -> Dict[str, Any]:
+        rag = db.list_rag_metrics(
+            start=start,
+            end=end,
+            metric_types=["retrieval_accuracy", "confidence_score", "response_latency", "fallbacks"],
+            limit=50000,
+        )
+        by_type: Dict[str, List[float]] = defaultdict(list)
+        for m in rag:
+            by_type[m.metric_type].append(float(m.value))
+
+        accuracy = _avg(by_type["retrieval_accuracy"]) * 100
+        confidence = _avg(by_type["confidence_score"]) * 100
+        latency = _avg(by_type["response_latency"])
+        fallbacks = len(by_type["fallbacks"])
+
+        conversations = db.count_conversations(start, end)
+        escalations = len(
+            db.list_conversation_events(
+                start=start,
+                end=end,
+                event_type="escalation_confirmed",
+                limit=50000,
+            )
+        )
+        agent_joins = len(
+            db.list_conversation_events(
+                start=start,
+                end=end,
+                event_type="agent_joined",
+                limit=50000,
+            )
+        )
+
+        escalation_rate = _rate(escalations, conversations)
+        resolution_rate = _rate(max(conversations - escalations, 0), conversations)
+        fallback_rate = _rate(fallbacks, conversations)
+
+        return {
+            "accuracy": accuracy,
+            "confidence": confidence,
+            "latency": latency,
+            "fallback_rate": fallback_rate,
+            "escalation_rate": escalation_rate,
+            "resolution_rate": resolution_rate,
+            "agent_join_rate": _rate(agent_joins, conversations),
+            "conversations": conversations,
+        }
+
+    current = _window_metrics(current_start, now)
+    previous = _window_metrics(previous_start, current_start)
+
+    # ------------------------------------------------------------------ #
+    # Total conversations & chatbot leads
+    # ------------------------------------------------------------------ #
+    total_conversations: int = _safe_non_negative_int(current.get("conversations", 0))
+
+    # Leads = quotes generated in the window that never progressed to payment.
+    # We exclude statuses that indicate payment was initiated or completed.
+    _PAYMENT_STATUSES = ["paid", "payment_initiated", "payment_pending", "completed", "active"]
+    try:
+        chatbot_leads: int = _safe_non_negative_int(
+            db.count_quotes(
+                current_start,
+                now,
+                exclude_statuses=_PAYMENT_STATUSES,
+            )
+        )
+    except Exception as e:
+        # Graceful fallback: count_quotes may not exist on the in-memory stub
+        logger.warning("count_quotes unavailable, defaulting chatbot_leads to 0: %s", e)
+        chatbot_leads = 0
+
+    # ------------------------------------------------------------------ #
+    # CSAT
+    # ------------------------------------------------------------------ #
+    csat_events_current = db.list_conversation_events(
+        start=current_start,
+        end=now,
+        event_type="csat",
+        limit=5000,
+    )
+    csat_events_previous = db.list_conversation_events(
+        start=previous_start,
+        end=current_start,
+        event_type="csat",
+        limit=5000,
+    )
+    csat_current_vals = [float((e.payload or {}).get("rating", 0)) for e in csat_events_current]
+    csat_prev_vals = [float((e.payload or {}).get("rating", 0)) for e in csat_events_previous]
+    csat_current = _avg([v for v in csat_current_vals if v > 0])
+    csat_previous = _avg([v for v in csat_prev_vals if v > 0])
+    csat_delta = round(csat_current - csat_previous, 2)
+
+    rated_threshold = 4
+    rated_current = [v for v in csat_current_vals if v > 0]
+    rated_prev = [v for v in csat_prev_vals if v > 0]
+    rated_current_correct = len([v for v in rated_current if v >= rated_threshold])
+    rated_prev_correct = len([v for v in rated_prev if v >= rated_threshold])
+    rated_accuracy_current = _rate(rated_current_correct, len(rated_current))
+    rated_accuracy_prev = _rate(rated_prev_correct, len(rated_prev))
+    rated_accuracy_delta = _delta(rated_accuracy_current, rated_accuracy_prev)
+    rated_coverage = _rate(len(rated_current), current["conversations"])
+
+    top_metrics = [
+        {
+            "label": "AI Accuracy (Rated)",
+            "value": _fmt_pct(rated_accuracy_current),
+            "delta": _fmt_delta(rated_accuracy_delta),
+            "tone": "positive" if rated_accuracy_current >= rated_accuracy_prev else "negative",
+        },
+        {
+            "label": "AI Resolution Rate",
+            "value": _fmt_pct(current["resolution_rate"]),
+            "delta": _fmt_delta(_delta(current["resolution_rate"], previous["resolution_rate"])),
+            "tone": "positive" if current["resolution_rate"] >= previous["resolution_rate"] else "negative",
+        },
+        {
+            "label": "Fallback Rate",
+            "value": _fmt_pct(current["fallback_rate"]),
+            "delta": _fmt_delta(_delta(current["fallback_rate"], previous["fallback_rate"])),
+            "tone": "positive" if current["fallback_rate"] <= previous["fallback_rate"] else "negative",
+        },
+        {
+            "label": "Agent Pickup Rate",
+            "value": _fmt_pct(current["agent_join_rate"]),
+            "delta": _fmt_delta(_delta(current["agent_join_rate"], previous["agent_join_rate"])),
+            "tone": "positive" if current["agent_join_rate"] >= previous["agent_join_rate"] else "negative",
+        },
+        {
+            "label": "Avg Response Time",
+            "value": _fmt_seconds(current["latency"]),
+            "delta": f"{_delta(current['latency'], previous['latency']):+.1f}s",
+            "tone": "positive" if current["latency"] <= previous["latency"] else "negative",
+        },
+    ]
+
+    # Trend data (accuracy + fallback) for last 7 days
+    trend_days = 7
+    trend_start = now - timedelta(days=trend_days)
+    trend_metrics = db.list_rag_metrics(
+        start=trend_start,
+        end=now,
+        metric_types=["retrieval_accuracy", "fallbacks", "confidence_score"],
+        limit=50000,
+    )
+    trend_by_day: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    for m in trend_metrics:
+        label = m.created_at.strftime("%a")
+        trend_by_day[label][m.metric_type].append(float(m.value))
+
+    trend_data = []
+    for i in range(trend_days):
+        day = (trend_start + timedelta(days=i)).strftime("%a")
+        acc = _avg(trend_by_day[day]["retrieval_accuracy"]) * 100
+        responses = len(trend_by_day[day]["confidence_score"])
+        fallbacks = len(trend_by_day[day]["fallbacks"])
+        fallback_rate = _rate(fallbacks, responses)
+        trend_data.append(
+            {"day": day, "accuracy": round(acc, 1), "fallback": round(fallback_rate, 1)}
+        )
+
+    # Conversation quality metrics
+    msg_stats = db.list_conversation_message_stats(current_start, now)
+    durations = []
+    message_counts = []
+    for row in msg_stats:
+        if row["min_ts"] and row["max_ts"]:
+            durations.append((row["max_ts"] - row["min_ts"]).total_seconds())
+        message_counts.append(row.get("message_count", 0))
+
+    avg_duration = _avg(durations) if durations else 0.0
+    avg_messages = _avg(message_counts) if message_counts else 0.0
+    completion_rate = current["resolution_rate"]
+    drop_off_rate = current["fallback_rate"]
+
+    quality_metrics = [
+        {
+            "label": "Total Handled",
+            "value": _format_count(current["conversations"]),
+            "change": _fmt_delta(_pct_change(current["conversations"], previous["conversations"]), 0),
+        },
+        {"label": "AI Resolution Rate", "value": _fmt_pct(completion_rate), "change": _fmt_delta(_delta(completion_rate, previous["resolution_rate"]))},
+        {"label": "Fallback Rate", "value": _fmt_pct(drop_off_rate), "change": _fmt_delta(_delta(drop_off_rate, previous["fallback_rate"]))},
+        {"label": "Avg Length", "value": _fmt_duration(avg_duration), "change": _fmt_delta(0.0, 0)},
+        {"label": "Avg Messages", "value": f"{avg_messages:.1f}", "change": _fmt_delta(0.0, 0)},
+    ]
+
+    quality_metrics.extend(
+        [
+            {
+                "label": "User CSAT",
+                "value": f"{csat_current:.1f}/5" if csat_current > 0 else "N/A",
+                "change": f"{csat_delta:+.1f}" if csat_current > 0 else "0",
+            },
+            {
+                "label": "Agent Pickup Rate",
+                "value": _fmt_pct(current["agent_join_rate"]),
+                "change": _fmt_delta(_delta(current["agent_join_rate"], previous.get("agent_join_rate", 0.0))),
+            },
+            {
+                "label": "Accuracy Coverage",
+                "value": _fmt_pct(rated_coverage),
+                "change": _fmt_delta(0.0, 0),
+            },
+            {
+                "label": "Rated Samples",
+                "value": _format_count(len(rated_current)),
+                "change": _fmt_delta(0.0, 0),
+            },
+        ]
+    )
+
+    # Intent recognition performance
+    def _infer_intent_from_message(message: str) -> str:
+        message_lower = (message or "").strip().lower()
+        if not message_lower:
+            return "unknown"
+
+        if any(word in message_lower for word in ["quote", "how much", "price", "cost", "premium"]):
+            return "quote"
+        if any(word in message_lower for word in ["buy", "purchase", "apply", "get insurance"]):
+            return "buy"
+        if any(word in message_lower for word in ["what is", "tell me about", "explain", "how does"]):
+            return "learn"
+        if any(word in message_lower for word in ["compare", "difference", "vs", "versus"]):
+            return "compare"
+        if any(word in message_lower for word in ["need", "looking for", "want", "recommend"]):
+            return "discover"
+        if any(word in message_lower for word in ["claim", "file", "submit"]):
+            return "claim"
+        return "general"
+
+    def _looks_like_structured_payload(content: str) -> bool:
+        normalized = (content or "").strip()
+        if not normalized:
+            return True
+        if normalized.startswith("{") and normalized.endswith("}"):
+            return True
+        if normalized.startswith("[") and normalized.endswith("]"):
+            return True
+        return False
+
+    intent_events = db.list_conversation_events(
+        start=current_start,
+        end=now,
+        event_type="intent",
+        limit=20000,
+    )
+
+    if not intent_events and hasattr(db, "list_messages"):
+        try:
+            fallback_user_messages = db.list_messages(
+                start=current_start,
+                end=now,
+                role="user",
+                limit=50000,
+            )
+            inferred_events = []
+            for msg in fallback_user_messages:
+                text = str(getattr(msg, "content", "") or "").strip()
+                if _looks_like_structured_payload(text):
+                    continue
+                inferred_events.append(
+                    {
+                        "payload": {
+                            "intent": _infer_intent_from_message(text),
+                            "intent_type": "INFERRED_FROM_MESSAGE",
+                            "confidence": 0.6,
+                            "user_message": text,
+                        },
+                        "created_at": getattr(msg, "timestamp", now),
+                    }
+                )
+
+            if inferred_events:
+                logger.info(
+                    "AI metrics intent fallback used inferred messages count=%s",
+                    len(inferred_events),
+                )
+
+                class _SyntheticIntentEvent:
+                    def __init__(self, payload: Dict[str, Any], created_at: datetime) -> None:
+                        self.payload = payload
+                        self.created_at = created_at
+
+                intent_events = [
+                    _SyntheticIntentEvent(payload=e["payload"], created_at=e["created_at"])
+                    for e in inferred_events
+                ]
+        except Exception as exc:
+            logger.warning("Failed to infer intent events from messages: %s", exc)
+
+    intent_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for ev in intent_events:
+        payload = ev.payload or {}
+        key = str(payload.get("intent") or "unknown")
+        intent_groups[key].append({"payload": payload, "created_at": ev.created_at})
+
+    def _trend_series(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Build today/weekly/monthly/yearly trend series.
+        Uses timezone-aware UTC datetimes throughout to avoid offset-naive vs
+        offset-aware comparison errors.
+        """
+        series = {}
+        now_utc = datetime.now(tz=timezone.utc)
+
+        def _aware(dt: datetime) -> datetime:
+            """Ensure a datetime is timezone-aware (UTC)."""
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        # Today (4-hour buckets)
+        start_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        buckets = []
+        for i in range(0, 24, 4):
+            label = f"{i:02d}:00"
+            start_bucket = start_today + timedelta(hours=i)
+            end_bucket = start_today + timedelta(hours=i + 4)
+            count = sum(1 for e in events if start_bucket <= _aware(e["created_at"]) < end_bucket)
+            buckets.append({"label": label, "inquiries": count})
+        series["today"] = buckets
+
+        # Weekly (last 7 days)
+        weekly = []
+        week_start = now_utc - timedelta(days=6)
+        for i in range(7):
+            day = week_start + timedelta(days=i)
+            label = day.strftime("%a")
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + timedelta(days=1)
+            count = sum(1 for e in events if day_start <= _aware(e["created_at"]) < day_end)
+            weekly.append({"label": label, "inquiries": count})
+        series["weekly"] = weekly
+
+        # Monthly (last 4 weeks)
+        monthly = []
+        for i in range(4):
+            start_week = now_utc - timedelta(days=(27 - i * 7))
+            end_week = start_week + timedelta(days=7)
+            count = sum(1 for e in events if start_week <= _aware(e["created_at"]) < end_week)
+            monthly.append({"label": f"Week {i + 1}", "inquiries": count})
+        series["monthly"] = monthly
+
+        # Yearly (last 12 months)
+        yearly = []
+        for i in range(12):
+            month_start = (now_utc.replace(day=1) - timedelta(days=30 * (11 - i))).replace(day=1)
+            month_end = (month_start + timedelta(days=32)).replace(day=1)
+            count = sum(1 for e in events if month_start <= _aware(e["created_at"]) < month_end)
+            yearly.append({"label": month_start.strftime("%b"), "inquiries": count})
+        series["yearly"] = yearly
+
+        return series
+
+    intent_rows = []
+    for intent_key, events in sorted(intent_groups.items(), key=lambda item: len(item[1]), reverse=True)[:5]:
+        confidences = [float(e["payload"].get("confidence", 0.0)) for e in events]
+        response_latencies = [float(e["payload"].get("response_latency", 0.0)) for e in events if e["payload"].get("response_latency") is not None]
+        top_regions = [str(e["payload"].get("region", "Unknown")) for e in events if e["payload"].get("region")]
+        products = [e["payload"].get("product_name") for e in events if e["payload"].get("product_name")]
+        product_counts = Counter([p for p in products if p])
+        product_breakdown = [
+            {"product": name, "inquiries": count, "share": f"{round((count / len(events)) * 100)}%"}
+            for name, count in product_counts.most_common(4)
+        ]
+
+        hours = [e["created_at"].hour for e in events]
+        peak_hour = max(hours, key=hours.count) if hours else 0
+        peak_window = f"{peak_hour:02d}:00 - {min(peak_hour + 2, 23):02d}:00 UTC"
+
+        intent_rows.append(
+            {
+                "category": intent_key.replace("_", " ").title(),
+                "volume": _format_count(len(events)),
+                "accuracy": round(_avg(confidences) * 100, 1),
+                "details": {
+                    "timeRange": f"Last {days} days",
+                    "peakWindow": peak_window,
+                    "avgHandleTime": _fmt_seconds(_avg(response_latencies)),
+                    "firstResponse": _fmt_seconds(_avg(response_latencies)),
+                    "confidenceBand": f"{round(min(confidences) * 100, 0) if confidences else 0}% - {round(max(confidences) * 100, 0) if confidences else 0}%",
+                    "topRegions": top_regions[:3] or ["Unknown"],
+                    "productBreakdown": product_breakdown,
+                    "trendSeries": _trend_series(events),
+                },
+            }
+        )
+
+    # RAG retrieval performance
+    rag_metrics = db.list_rag_metrics(
+        start=current_start,
+        end=now,
+        metric_types=["retrieval_accuracy", "confidence_score", "response_latency", "fallbacks"],
+        limit=50000,
+    )
+    rag_by_type: Dict[str, List[float]] = defaultdict(list)
+    for m in rag_metrics:
+        rag_by_type[m.metric_type].append(float(m.value))
+    retrieval_success = _avg(rag_by_type["retrieval_accuracy"]) * 100
+    avg_latency_ms = _avg(rag_by_type["response_latency"]) * 1000
+    doc_relevance = _avg(rag_by_type["confidence_score"]) * 10
+
+    rag_context_rows = [
+        {"doc": "Retrieval Accuracy", "accuracy": _fmt_pct(retrieval_success, 1)},
+        {"doc": "Confidence Score", "accuracy": f"{doc_relevance:.1f}/10"},
+        {"doc": "Fallback Rate", "accuracy": _fmt_pct(current["fallback_rate"], 1)},
+    ]
+
+    weakness_rows = []
+    low_conf_events = [e for e in intent_events if float(e.payload.get("confidence", 1.0)) < 0.4]
+    for e in low_conf_events[:6]:
+        conf = float(e.payload.get("confidence", 0.0))
+        if conf < 0.3:
+            severity = "high"
+        elif conf < 0.4:
+            severity = "medium"
+        else:
+            severity = "low"
+        weakness_rows.append(
+            {
+                "category": (e.payload.get("intent") or "Unknown").replace("_", " ").title(),
+                "query": (e.payload.get("user_message") or "")[:60],
+                "confidence": round(conf * 100, 1),
+                "severity": severity,
+                "frequency": 1,
+            }
+        )
+
+    total_intent_events = len(intent_events)
+    intent_counts = Counter({intent: len(events) for intent, events in intent_groups.items()})
+
+    high_volume_intents = []
+    if total_intent_events > 0:
+        for intent, count in intent_counts.most_common(3):
+            share = (count / total_intent_events) * 100
+            if share >= 15:
+                high_volume_intents.append((intent.replace("_", " ").title(), round(share)))
+
+    if total_intent_events == 0:
+        suggested_intents_note = "No recent intent traffic to analyze yet."
+    elif high_volume_intents:
+        top_list = ", ".join([f"{name} ({share}%)" for name, share in high_volume_intents])
+        suggested_intents_note = f"Top intent volume: {top_list}. Review overlap for consolidation."
+    else:
+        suggested_intents_note = f"Intent traffic is spread across {len(intent_groups)} categories; no dominant overlap signal."
+
+    if total_intent_events == 0:
+        training_needs_note = "No recent intent-confidence data available."
+    else:
+        low_conf_rate = (len(low_conf_events) / total_intent_events) * 100
+        weakest_intent = None
+        weakest_conf = 100.0
+        for intent, events in intent_groups.items():
+            confidences = [
+                float((item.get("payload") or {}).get("confidence", 0.0))
+                for item in events
+                if (item.get("payload") or {}).get("confidence") is not None
+            ]
+            if len(confidences) < 3:
+                continue
+            avg_conf = _avg(confidences) * 100
+            if avg_conf < weakest_conf:
+                weakest_conf = avg_conf
+                weakest_intent = intent.replace("_", " ").title()
+
+        if weakest_intent:
+            training_needs_note = (
+                f"{low_conf_rate:.1f}% of intent events are low-confidence; prioritize {weakest_intent} "
+                f"({weakest_conf:.0f}% avg confidence)."
+            )
+        else:
+            training_needs_note = f"{low_conf_rate:.1f}% of intent events are low-confidence; gather more labeled samples."
+
+    learning_ops = [
+        {"title": "Unanswered Gaps", "note": f"{len(low_conf_events)} low-confidence topics detected."},
+        {"title": "Suggested Intents", "note": suggested_intents_note},
+        {"title": "Training Needs", "note": training_needs_note},
+    ]
+
+    escalations = db.list_escalations(current_start, now)
+    reason_counts = Counter([(e.escalation_reason or "Unspecified") for e in escalations])
+    total_escalations = sum(reason_counts.values()) or 1
+    escalation_reasons = [
+        {
+            "reason": reason,
+            "cases": count,
+            "progress": round((count / total_escalations) * 100),
+            "tone": "good" if count / total_escalations < 0.5 else "bad",
+        }
+        for reason, count in reason_counts.most_common(4)
+    ]
+
+    last_hour_metrics = db.list_rag_metrics(
+        start=now - timedelta(hours=1),
+        end=now,
+        metric_types=["response_latency", "fallbacks", "confidence_score", HEARTBEAT_METRIC_TYPE],
+        limit=5000,
+    )
+    last_hour_events = db.list_conversation_events(
+        start=now - timedelta(hours=1),
+        end=now,
+        limit=5000,
+    )
+    request_event_types = {"chat_request", "guided_start"}
+    last_hour_requests = len([e for e in last_hour_events if str(getattr(e, "event_type", "")) in request_event_types])
+    heartbeat_metrics = [m for m in last_hour_metrics if str(getattr(m, "metric_type", "")) == HEARTBEAT_METRIC_TYPE]
+    latest_heartbeat = max((getattr(m, "created_at", None) for m in heartbeat_metrics if getattr(m, "created_at", None)), default=None)
+
+    heartbeat_is_recent = False
+    if latest_heartbeat is not None:
+        normalized_latest_heartbeat = latest_heartbeat
+        if getattr(normalized_latest_heartbeat, "tzinfo", None) is not None:
+            normalized_latest_heartbeat = normalized_latest_heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+        heartbeat_age_seconds = (now - normalized_latest_heartbeat).total_seconds()
+        heartbeat_is_recent = heartbeat_age_seconds <= (_heartbeat_interval_seconds() * 2)
+
+    if heartbeat_is_recent:
+        uptime_value = "Online"
+        uptime_status = "Online"
+        uptime_note = "Heartbeat active (last 10 minutes)"
+    elif last_hour_requests > 0:
+        uptime_value = "Degraded"
+        uptime_status = "Degraded"
+        uptime_note = "User traffic seen, but heartbeat is stale"
+    elif _heartbeat_enabled():
+        uptime_value = "N/A"
+        uptime_status = "Unknown"
+        uptime_note = "No recent traffic or heartbeat in the last hour"
+    else:
+        uptime_value = "Online" if last_hour_metrics else "N/A"
+        uptime_status = "Online" if last_hour_metrics else "Unknown"
+        uptime_note = "Heartbeat disabled; derived from live metrics"
+
+    model_health = [
+        {
+            "label": "AI Service Uptime",
+            "value": uptime_value,
+            "note": uptime_note,
+            "status": uptime_status,
+        },
+        {"label": "Inference Latency", "value": f"{avg_latency_ms:.0f}ms", "note": "Avg over period", "status": "Online"},
+        {"label": "API Request Volume", "value": f"{last_hour_requests}/hr", "note": "Recent demand", "status": "Online"},
+        {"label": "AI Error Rate", "value": _fmt_pct(current["fallback_rate"], 1), "note": "Fallbacks as proxy", "status": "Online"},
+    ]
+
+    return {
+        "topMetrics": top_metrics,
+        "accuracyRatedMeta": {
+            "coverage": _fmt_pct(rated_coverage),
+            "samples": _format_count(len(rated_current)),
+        },
+        "trendData": trend_data,
+        "qualityMetrics": quality_metrics,
+        "intentRows": intent_rows,
+        "ragContextRows": rag_context_rows,
+        "ragWeaknessRows": weakness_rows,
+        "learningOps": learning_ops,
+        "escalationReasons": escalation_reasons,
+        "modelHealth": model_health,
+        # ---- real business counts ----
+        "totalConversations": total_conversations,
+        "chatbotLeads": chatbot_leads,
+        # Backward-compatible aliases
+        "total_conversations": total_conversations,
+        "chatbot_leads": chatbot_leads,
+    }
+
+
+@api_router.post("/metrics/csat", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+async def post_csat_feedback(
+    body: CSATFeedbackRequest,
+    db: PostgresDB = Depends(get_db),
+):
+    session_id = (body.session_id or "").strip() or None
+    user_id = (body.user_id or "").strip() or None
+    conversation_id: Optional[str] = None
+
+    if session_id:
+        session = state_manager.get_session(session_id) or {}
+        conversation_id = session.get("conversation_id") or session_id
+
+    if not conversation_id and user_id:
+        conversation_id = user_id
+
+    if not conversation_id:
+        raise HTTPException(status_code=400, detail="session_id or user_id is required")
+
+    payload = {
+        "rating": int(body.rating),
+        "feedback": (body.feedback or "").strip(),
+        "session_id": session_id,
+        "user_id": user_id,
+        **(body.metadata or {}),
+    }
+
+    try:
+        db.add_conversation_event(
+            conversation_id=conversation_id,
+            event_type="csat",
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.error("Failed to store CSAT feedback: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store feedback")
+
+    return {"success": True}
+
+
+async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: PostgresDB) -> ChatResponse:
+    user = db.get_or_create_user(phone_number=request.user_id)
+    internal_user_id = str(user.id)
+
+    session_id = request.session_id
+    if not session_id:
+        session_id = state_manager.create_session(internal_user_id)
+    else:
+        existing_session = state_manager.get_session(session_id)
+        if not existing_session:
+            session_id = state_manager.create_session(internal_user_id)
+
+    response = await router.route(
+        message=request.message or "",
+        session_id=session_id,
+        user_id=internal_user_id,
+        form_data=request.form_data,
+        db=db,
+    )
+
+    if response.get("mode") == "escalated" and (request.message or "").strip():
+        response["queued_for_agent"] = True
+
+    session = state_manager.get_session(session_id)
+    if session:
+        user_metadata = dict(request.metadata or {})
+        if request.form_data is not None:
+            user_content = _format_structured_payload(request.form_data)
+            user_metadata["form_data"] = request.form_data
+        else:
+            # Mask free-text PII before persisting so personal details never
+            # land in the database. Form payloads are business data and are
+            # intentionally stored unredacted (see src.utils.pii_redaction).
+            user_content, _ = redact_text(request.message)
+        db.add_message(
+            conversation_id=session["conversation_id"],
+            role="user",
+            content=user_content,
+            metadata=user_metadata,
+        )
+        if hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=session["conversation_id"],
+                    event_type="chat_request",
+                    payload={
+                        "mode": response.get("mode", "conversational"),
+                        "has_form_data": request.form_data is not None,
+                        "message_length": len((request.message or "").strip()),
+                        "flow": session.get("current_flow"),
+                    },
+                )
+            except Exception:
+                pass
+        cached_messages = list(session.get("recent_messages") or [])
+        cached_messages.append({"role": "user", "content": user_content})
+
+        if response.get("mode") != "escalated":
+            resp_val = response.get("response")
+            if isinstance(resp_val, dict):
+                nested_response = resp_val.get("response")
+                if isinstance(nested_response, (dict, list)):
+                    assistant_content = _format_structured_payload(nested_response, prefix="Assistant update")
+                else:
+                    assistant_content = str(nested_response or resp_val.get("message") or _format_structured_payload(resp_val, prefix="Assistant update"))
+            else:
+                assistant_content = str(resp_val)
+            db.add_message(
+                conversation_id=session["conversation_id"],
+                role="assistant",
+                content=assistant_content,
+                metadata={"mode": response.get("mode")},
+            )
+            cached_messages.append({"role": "assistant", "content": assistant_content})
+
+        state_manager.update_session(session_id, {"recent_messages": cached_messages[-10:]})
+
+    return ChatResponse(response=response, session_id=session_id, mode=response.get("mode", "conversational"), timestamp=datetime.now().isoformat())
+
+
+@api_router.get("/general-information", tags=["General Information"])
+async def get_general_information(
+    request: Request,
+    product: str,
+    redis=Depends(get_redis)
+):
+    logger = logging.getLogger("general_information")
+    logger.info(f"General info request: product={product}")
+
+    try:
+        BASE_DIR = Path(__file__).resolve().parents[2]
+        PRODUCT_DIR = BASE_DIR / "general_information" / "product_json"
+
+        product_file = _resolve_general_info_file(product, PRODUCT_DIR)
+
+        if product_file is None:
+            logger.error("Product information not found for product=%s", product)
+            raise HTTPException(status_code=404, detail="Product information not found")
+
+        logger.info(f"Resolved product file path: {product_file}")
+
+        # --- Load JSON ---
+        try:
+            with open(product_file, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Failed to load product file %s: %s", product_file, e)
+            raise HTTPException(status_code=500, detail="Failed to load product information")
+
+        if not isinstance(info, dict):
+            raise HTTPException(status_code=500, detail="Invalid product information format")
+
+        normalized_response = {
+            "product_id": info.get("product_id") or product_file.stem,
+            "title": info.get("title") or product_file.stem.replace("-", " ").replace("_", " ").title(),
+            "definition": info.get("definition") or "",
+            "benefits": info.get("benefits") or [],
+            "eligibility": info.get("eligibility") or "",
+            "source_url": info.get("source_url") or "",
+        }
+
+        sections = _build_general_info_sections(info)
+        normalized_response["sections"] = sections
+        normalized_response["readable_text"] = _build_general_info_readable_text(
+            normalized_response["title"], sections
+        )
+
+        logger.info("General info served for product=%s via file=%s", product, product_file.name)
+        return JSONResponse(content=normalized_response)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error in general info endpoint for product=%s: %s", product, e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@api_router.post("/session", response_model=CreateSessionResponse, tags=["Sessions"])
+async def create_session(
+    body: CreateSessionRequest,
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        user = db.get_or_create_user(phone_number=body.user_id)
+        session_id = state_manager.create_session(str(user.id))
+        return CreateSessionResponse(session_id=session_id, user_id=body.user_id)
+    except Exception as e:
+        logger.error(f"Error creating session: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/session/{session_id}")
+async def get_session_state(session_id: str):
+    try:
+        session = state_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        step = session.get("current_step", 0)
+        step_name = None
+        steps_total = None
+        current_flow = session.get("current_flow")
+
+        step_names = get_flow_steps(current_flow)
+        if step_names is not None:
+            step_name = step_names[step] if step < len(step_names) else None
+            steps_total = len(step_names)
+        elif current_flow == "journey":
+            step_name = "dynamic"
+            steps_total = None
+
+        return {
+            "session_id": session_id,
+            "mode": session.get("mode", "conversational"),
+            "current_flow": current_flow,
+            "current_step": step,
+            "step_name": step_name,
+            "steps_total": steps_total,
+            "collected_keys": list((session.get("collected_data") or {}).keys()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/forms/draft/{session_id}/{flow_name}", tags=["Forms"])
+async def get_form_draft(session_id: str, flow_name: str):
+    try:
+        draft = state_manager.get_form_draft(session_id, flow_name)
+        if not draft:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return draft
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting form draft: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.delete("/forms/draft/{session_id}/{flow_name}", tags=["Forms"])
+async def delete_form_draft(session_id: str, flow_name: str):
+    try:
+        state_manager.clear_form_draft(session_id, flow_name)
+        return {"status": "deleted", "session_id": session_id, "flow": flow_name}
+    except Exception as e:
+        logger.error(f"Error deleting form draft: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/chat/start-guided", tags=["Chat"])
+async def start_guided_body(
+    body: StartGuidedRequest,
+    router: ChatRouter = Depends(get_router),
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        session_id = body.session_id
+        user = db.get_or_create_user(phone_number=body.user_id)
+        internal_user_id = str(user.id)
+        if not session_id:
+            session_id = state_manager.create_session(internal_user_id)
+        response = await router.guided.start_flow(
+            flow_name=body.flow_name,
+            session_id=session_id,
+            user_id=internal_user_id,
+            initial_data=body.initial_data or {},
+        )
+        session = state_manager.get_session(session_id) or {}
+        conversation_id = session.get("conversation_id")
+        if conversation_id and hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id,
+                    event_type="guided_start",
+                    payload={
+                        "flow": body.flow_name,
+                        "has_initial_data": bool(body.initial_data),
+                    },
+                )
+            except Exception:
+                pass
+        return {"session_id": session_id, **response}
+    except Exception as e:
+        logger.error(f"Error starting guided flow: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/chat/message", response_model=ChatResponse)
+async def api_send_message(
+    request: ChatMessage,
+    router: ChatRouter = Depends(get_router),
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        return await _handle_chat_message(request, router, db)
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": e.message,
+                "field_errors": e.field_errors,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    from src.chatbot.dependencies import get_api_keys
+    import hmac
+
+    api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+    valid_keys = get_api_keys()
+    candidate = (api_key or "").strip()
+    ok = bool(candidate) and any(hmac.compare_digest(candidate, k) for k in valid_keys)
+    if not ok:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await websocket.accept()
+
+    while True:
+        try:
+            data = await websocket.receive_json()
+        except WebSocketDisconnect:
+            break
+        except Exception:
+            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+            break
+
+        try:
+            msg = ChatMessage(**data)
+        except ValidationError as e:
+            await websocket.send_json({"error": "invalid_payload", "details": e.errors()})
+            continue
+
+        try:
+            resp = await _handle_chat_message(msg, chat_router, postgres_db)
+        except FormValidationError as e:
+            await websocket.send_json({"error": "validation_error", "message": e.message, "field_errors": e.field_errors})
+            continue
+        except Exception as e:
+            logger.error("Error processing websocket message: %s", e, exc_info=True)
+            await websocket.send_json({"error": "server_error", "detail": "An error occurred while processing your message."})
+            continue
+
+        await websocket.send_json(resp.dict())
+
+
+# ---------- Product routes ----------
+def _public_product(matcher: ProductMatcher, item: Dict[str, Any]) -> Dict[str, Any]:
+    doc_id = item.get("doc_id") or item.get("product_id") or ""
+    public_id = (item.get("product_key") or matcher.get_public_id(doc_id) or doc_id) if doc_id else (item.get("product_key") or "")
+    return {
+        "product_id": public_id,
+        "doc_id": doc_id,
+        "slug": item.get("slug") or "",
+        "name": item.get("name") or "",
+        "category": item.get("category_name") or "",
+        "subcategory": item.get("sub_category_name") or "",
+        "url": item.get("url"),
+    }
+
+
+def _resolve_product_doc_id(matcher: ProductMatcher, product_id: str) -> str:
+    doc_id = matcher.resolve_doc_id(product_id)
+    if not doc_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found. Use full doc_id (website:product:...) or short key (category/subcategory/slug).",
+        )
+    return doc_id
+
+
+@api_router.get("/products/list", tags=["Products"])
+async def api_list_products(
+    category: Optional[str] = Query(None),
+    subcategory: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    matcher: ProductMatcher = Depends(lambda: product_matcher),
+):
+    try:
+        if search and search.strip():
+            scored = matcher.match_products(search.strip(), top_k=50)
+            products = [p[2] for p in scored]
+        elif category:
+            products = matcher.get_products_by_category(category)
+            if subcategory and subcategory.strip():
+                sub_lower = subcategory.strip().lower()
+                products = [p for p in products if (p.get("sub_category_name") or "").lower() == sub_lower]
+        else:
+            products = list(matcher.product_index.values())
+            if subcategory and subcategory.strip():
+                sub_lower = subcategory.strip().lower()
+                products = [p for p in products if (p.get("sub_category_name") or "").lower() == sub_lower]
+        public = [_public_product(matcher, p) for p in products]
+        return {"products": public, "count": len(public)}
+    except Exception as e:
+        logger.error(f"Error listing products: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/products/card/{product_id:path}", tags=["Products"])
+async def api_get_product_card(
+    product_id: str,
+    include_details: bool = False,
+    matcher: ProductMatcher = Depends(lambda: product_matcher),
+):
+    try:
+        doc_id = _resolve_product_doc_id(matcher, product_id)
+        card = product_card_gen.generate_card(doc_id, False)
+        if not card:
+            raise HTTPException(status_code=404, detail="Product not found")
+        if include_details:
+            card["details"] = await product_card_gen.get_product_details(doc_id)
+
+        public_id = matcher.get_public_id(doc_id) or doc_id
+        card["product_id"] = public_id
+        card["doc_id"] = doc_id
+        if isinstance(card.get("details"), dict):
+            card["details"]["product_id"] = public_id
+            card["details"]["doc_id"] = doc_id
+            rel = card["details"].get("related_products")
+            if isinstance(rel, list):
+                for r in rel:
+                    if isinstance(r, dict) and r.get("product_id"):
+                        r_doc = r["product_id"]
+                        r["product_id"] = matcher.get_public_id(r_doc) or r_doc
+                        r["doc_id"] = r_doc
+        return card
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting product: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/products/card/{product_id:path}/details", tags=["Products"])
+async def api_get_product_card_details(
+    product_id: str,
+    matcher: ProductMatcher = Depends(lambda: product_matcher),
+):
+    try:
+        doc_id = _resolve_product_doc_id(matcher, product_id)
+        details = await product_card_gen.get_product_details(doc_id)
+        public_id = matcher.get_public_id(doc_id) or doc_id
+        if isinstance(details, dict):
+            details["product_id"] = public_id
+            details["doc_id"] = doc_id
+            rel = details.get("related_products")
+            if isinstance(rel, list):
+                for r in rel:
+                    if isinstance(r, dict) and r.get("product_id"):
+                        r_doc = r["product_id"]
+                        r["product_id"] = matcher.get_public_id(r_doc) or r_doc
+                        r["doc_id"] = r_doc
+        return details
+    except Exception as e:
+        logger.error(f"Error getting product details: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_product_quote_preview(product_id: str, body: ProductQuotePreviewRequest) -> Dict[str, Any]:
+    from src.integrations.policy.journey_orchestrator import journey_orchestrator
+
+    return await journey_orchestrator.run_underwriting_and_quotation_preview(
+        user_id=body.user_id,
+        product_id=product_id,
+        underwriting_data=body.underwriting_data,
+        currency=body.currency,
+        metadata=body.metadata,
+    )
+
+
+@api_router.post("/products/personal-accident/quote-preview", tags=["Product Quote Testing"])
+async def preview_personal_accident_quote(body: ProductQuotePreviewRequest):
+    return await _run_product_quote_preview("personal_accident", body)
+
+
+@api_router.post("/products/motor-private/quote-preview", tags=["Product Quote Testing"])
+async def preview_motor_private_quote(body: ProductQuotePreviewRequest):
+    return await _run_product_quote_preview("motor_private", body)
+
+
+@api_router.post("/products/travel-insurance/quote-preview", tags=["Product Quote Testing"])
+async def preview_travel_insurance_quote(body: ProductQuotePreviewRequest):
+    return await _run_product_quote_preview("travel_insurance", body)
+
+
+@api_router.post("/products/serenicare/quote-preview", tags=["Product Quote Testing"])
+async def preview_serenicare_quote(body: ProductQuotePreviewRequest):
+    return await _run_product_quote_preview("serenicare", body)
+
+
+@api_router.get("/products/quotes/{quote_id}/download", tags=["Product Quote Testing"])
+async def download_product_quote_pdf(quote_id: str):
+    pdf_bytes = get_quote_pdf(quote_id)
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail="Quote PDF not found")
+
+    metadata = get_quote_metadata(quote_id) or {}
+    product_name = str(metadata.get("product_name") or "quote").strip().replace(" ", "_").lower()
+    filename = f"{product_name}_{quote_id}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@api_router.post("/forms/personal-accident/full", response_model=PersonalAccidentFullFormResponse, tags=["Forms"])
+async def submit_personal_accident_full_form(body: PersonalAccidentFullFormRequest, db: PostgresDB = Depends(get_db)):
+    from src.chatbot.flows.personal_accident import PersonalAccidentFlow
+    try:
+        user = db.get_or_create_user(phone_number=body.user_id)
+        internal_user_id = str(user.id)
+        flow = PersonalAccidentFlow(product_matcher, db)
+        payload: Dict[str, Any] = dict(body.data or {})
+        data: Dict[str, Any] = {"user_id": internal_user_id, "product_id": "personal_accident"}
+        quick_quote: Dict[str, Any] = {
+            "first_name": payload.get("first_name") or payload.get("firstName", ""),
+            "last_name": payload.get("surname") or payload.get("lastName", ""),
+            "middle_name": payload.get("middle_name") or payload.get("middleName", ""),
+            "email": payload.get("email", ""),
+            "mobile": payload.get("mobile") or payload.get("mobile_number", ""),
+            "dob": payload.get("dob"),
+            "policy_start_date": payload.get("policyStartDate") or payload.get("policy_start_date"),
+            "cover_limit_ugx": int(payload.get("coverLimitAmountUgx") or payload.get("cover_limit_amount_ugx") or 10_000_000),
+        }
+        data["quick_quote"] = quick_quote
+        await flow._step_personal_details(payload, data, internal_user_id)
+        await flow._step_next_of_kin(payload, data, internal_user_id)
+        await flow._step_previous_pa_policy(payload, data, internal_user_id)
+        await flow._step_physical_disability(payload, data, internal_user_id)
+        await flow._step_risky_activities(payload, data, internal_user_id)
+        await flow._step_upload_national_id(payload, data, internal_user_id)
+        sum_assured = int((data.get("quick_quote") or {}).get("cover_limit_ugx", 10_000_000))
+        premium = flow._calculate_pa_premium(data, sum_assured)
+        quote = db.create_quote(
+            user_id=internal_user_id,
+            product_id=data.get("product_id", "personal_accident"),
+            premium_amount=premium["monthly"],
+            sum_assured=sum_assured,
+            underwriting_data=data,
+            pricing_breakdown=premium.get("breakdown"),
+            product_name="Personal Accident",
+        )
+        return PersonalAccidentFullFormResponse(
+            quote_id=str(quote.id),
+            product_name="Personal Accident",
+            monthly_premium=premium["monthly"],
+            annual_premium=premium["annual"],
+            sum_assured=sum_assured,
+            breakdown=premium.get("breakdown", {}),
+        )
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "validation_error", "message": e.message, "field_errors": e.field_errors},
+        )
+    except Exception as e:
+        logger.error(f"Error submitting Personal Accident full form: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/forms/motor-private/full", response_model=MotorPrivateFullFormResponse, tags=["Forms"])
+async def submit_motor_private_full_form(body: MotorPrivateFullFormRequest, db: PostgresDB = Depends(get_db)):
+    from src.chatbot.controllers.motor_private_controller import MotorPrivateController
+    try:
+        controller = MotorPrivateController(db)
+        result = await controller.submit_full_form(body.user_id, body.data or {})
+        return MotorPrivateFullFormResponse(
+            quote_id=result["quote_id"],
+            product_name=result["product_name"],
+            total_premium=result["total_premium"],
+            breakdown=result["breakdown"],
+        )
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "validation_error", "message": e.message, "field_errors": e.field_errors},
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error submitting Motor Private full form: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/forms/travel-insurance/full", response_model=TravelInsuranceFullFormResponse, tags=["Forms"])
+async def submit_travel_insurance_full_form(body: TravelInsuranceFullFormRequest, db: PostgresDB = Depends(get_db)):
+    from src.chatbot.controllers.travel_insurance_controller import TravelInsuranceController
+    from src.integrations.policy.journey_orchestrator import journey_orchestrator
+    try:
+        user = db.get_or_create_user(phone_number=body.user_id)
+        internal_user_id = str(user.id)
+        controller = TravelInsuranceController(db)
+        payload: Dict[str, Any] = dict(body.data or {})
+        app = controller.create_application(internal_user_id, {})
+        app_id = app["id"]
+        controller.update_about_you(app_id, payload)
+        controller.update_travel_party_and_trip(app_id, payload)
+        controller.update_data_consent(app_id, payload)
+        controller.update_traveller_details(app_id, payload)
+        if any(k in payload for k in ("ec_surname", "ec_relationship", "ec_phone_number", "ec_email")):
+            controller.update_emergency_contact(app_id, payload)
+        if any(k in payload for k in ("bank_name", "account_holder_name", "account_number")):
+            controller.update_bank_details(app_id, payload)
+        data: Dict[str, Any] = {
+            "selected_product": payload.get("selected_product") or {"id": payload.get("product_id", "worldwide_essential")},
+            "travel_party_and_trip": {
+                "travel_party": payload.get("travel_party"),
+                "num_travellers_18_69": payload.get("num_travellers_18_69", 1),
+                "num_travellers_0_17": payload.get("num_travellers_0_17", 0),
+                "num_travellers_70_75": payload.get("num_travellers_70_75", 0),
+                "num_travellers_76_80": payload.get("num_travellers_76_80", 0),
+                "num_travellers_81_85": payload.get("num_travellers_81_85", 0),
+                "departure_date": payload.get("departure_date"),
+                "return_date": payload.get("return_date"),
+                "departure_country": payload.get("departure_country"),
+                "destination_country": payload.get("destination_country"),
+            },
+            "priceInclTax": payload.get("priceInclTax") or payload.get("price_incl_tax"),
+            "quoteid": payload.get("quoteid") or payload.get("quote_id"),
+        }
+        pricing = journey_orchestrator.calculate_product_premium("travel_insurance", {"data": data})
+        pricing.setdefault("breakdown", {})
+        if pricing["breakdown"].get("days") is None:
+            dep = data.get("travel_party_and_trip", {}).get("departure_date")
+            ret = data.get("travel_party_and_trip", {}).get("return_date")
+            try:
+                dep_date = datetime.fromisoformat(str(dep)[:10]).date()
+                ret_date = datetime.fromisoformat(str(ret)[:10]).date()
+                pricing["breakdown"]["days"] = max(0, (ret_date - dep_date).days + 1)
+            except Exception:
+                pass
+        result = controller.finalize_and_create_quote(app_id, internal_user_id, pricing)
+        quote_id = (result or {}).get("quote_id") or ""
+
+        if quote_id:
+            try:
+                from src.integrations.clients.real_http.travel_quote_generator import generate_travel_quote
+
+                trip = data.get("travel_party_and_trip") or {}
+                selected_product = data.get("selected_product") or {}
+                first_name = str(payload.get("first_name") or "").strip()
+                surname = str(payload.get("surname") or "").strip()
+                client_name = f"{first_name} {surname}".strip()
+
+                travel_quote_meta = generate_travel_quote(
+                    {
+                        "quoteid": quote_id,
+                        "priceInclTax": pricing.get("total_usd", 0),
+                        "clientName": client_name,
+                        "planName": str(selected_product.get("label") or selected_product.get("id") or "Travel Insurance"),
+                        "durationDays": (pricing.get("breakdown") or {}).get("days", 0),
+                        "formattedStartDate": str(trip.get("departure_date") or ""),
+                        "formattedEndDate": str(trip.get("return_date") or ""),
+                        "destinationArea": str(trip.get("destination_area") or trip.get("destination_country") or ""),
+                        "adults": trip.get("num_travellers_18_69", 0),
+                        "children": trip.get("num_travellers_0_17", 0),
+                        "seniors": (
+                            int(trip.get("num_travellers_70_75", 0) or 0)
+                            + int(trip.get("num_travellers_76_80", 0) or 0)
+                            + int(trip.get("num_travellers_81_85", 0) or 0)
+                        ),
+                        "country": "ug",
+                        "currency": "USD",
+                    }
+                )
+                pricing["breakdown"]["benefits"] = travel_quote_meta.get("benefits", "")
+                pricing["breakdown"]["benefitsUrl"] = travel_quote_meta.get("benefitsUrl", "")
+            except Exception as meta_err:
+                logger.warning("Travel quote metadata enrichment failed: %s", meta_err)
+
+        return TravelInsuranceFullFormResponse(
+            quote_id=quote_id,
+            product_name=(data["selected_product"] or {}).get("label", "Travel Insurance"),
+            total_premium_ugx=pricing["total_ugx"],
+            total_premium_usd=pricing["total_usd"],
+            breakdown=pricing.get("breakdown", {}),
+        )
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "validation_error", "message": e.message, "field_errors": e.field_errors},
+        )
+    except Exception as e:
+        logger.error(f"Error submitting Travel Insurance full form: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/forms/serenicare/full", response_model=SerenicareFullFormResponse, tags=["Forms"])
+async def submit_serenicare_full_form(body: SerenicareFullFormRequest, db: PostgresDB = Depends(get_db)):
+    from src.chatbot.controllers.serenicare_controller import SerenicareController
+    from src.integrations.policy.journey_orchestrator import journey_orchestrator
+    try:
+        user = db.get_or_create_user(phone_number=body.user_id)
+        internal_user_id = str(user.id)
+        controller = SerenicareController(db)
+        payload: Dict[str, Any] = dict(body.data or {})
+        app = controller.create_application(internal_user_id, {})
+        app_id = app["id"]
+        controller.update_about_you(app_id, payload)
+        controller.update_plan_selection(app_id, payload)
+        controller.update_optional_benefits(app_id, payload)
+        controller.update_medical_conditions(app_id, payload)
+        controller.update_cover_personalization(app_id, payload)
+        plan = {"id": payload.get("plan_option", "essential")}
+        pricing = journey_orchestrator.calculate_product_premium("serenicare", {"data": payload, "plan": plan})
+        pricing.setdefault("breakdown", {})
+        pricing["breakdown"].setdefault("plan_id", pricing.get("plan_id") or plan.get("id"))
+        result = controller.finalize_and_create_quote(app_id, internal_user_id, pricing)
+        quote_id = (result or {}).get("quote_id") or ""
+        return SerenicareFullFormResponse(
+            quote_id=quote_id,
+            product_name="Serenicare",
+            monthly_premium=pricing["monthly"],
+            annual_premium=pricing["annual"],
+            breakdown=pricing.get("breakdown", {}),
+        )
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "validation_error", "message": e.message, "field_errors": e.field_errors},
+        )
+    except Exception as e:
+        logger.error(f"Error submitting Serenicare full form: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _humanize_field_name(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name or "").replace("_", " ").replace("-", " ")).strip().title()
+
+
+def _format_payload_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        compact = []
+        for key, item in value.items():
+            compact.append(f"{_humanize_field_name(str(key))}: {_format_payload_value(item)}")
+        return "; ".join(part for part in compact if part)
+    return str(value)
+
+
+def _format_structured_payload(payload: Any, prefix: str = "Submitted details") -> str:
+    if isinstance(payload, dict):
+        lines = []
+        for key, value in payload.items():
+            rendered = _format_payload_value(value)
+            if rendered:
+                lines.append(f"- {_humanize_field_name(str(key))}: {rendered}")
+        if lines:
+            return "\n".join([f"{prefix}:"] + lines)
+        return prefix
+
+    if isinstance(payload, list):
+        rendered = _format_payload_value(payload)
+        return f"{prefix}: {rendered}" if rendered else prefix
+
+    text = str(payload or "").strip()
+    return text or prefix
+
+
+def _normalize_text_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _build_general_info_sections(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sections: List[Dict[str, Any]] = []
+
+    definition = str(info.get("definition") or "").strip()
+    if definition:
+        sections.append(
+            {
+                "heading": "Definition",
+                "content": definition,
+                "content_type": "paragraph",
+            }
+        )
+
+    benefits = _normalize_text_list(info.get("benefits"))
+    if benefits:
+        sections.append(
+            {
+                "heading": "Benefits",
+                "content": benefits,
+                "content_type": "list",
+            }
+        )
+
+    eligibility = str(info.get("eligibility") or "").strip()
+    if eligibility:
+        sections.append(
+            {
+                "heading": "Eligibility",
+                "content": eligibility,
+                "content_type": "paragraph",
+            }
+        )
+
+    additional_fields = [
+        ("exclusions", "Exclusions"),
+        ("requirements", "Requirements"),
+        ("important_notes", "Important Notes"),
+    ]
+    for key, heading in additional_fields:
+        values = _normalize_text_list(info.get(key))
+        if values:
+            sections.append(
+                {
+                    "heading": heading,
+                    "content": values,
+                    "content_type": "list",
+                }
+            )
+
+    return sections
+
+
+def _build_general_info_readable_text(title: str, sections: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    title = str(title or "").strip()
+    if title:
+        lines.append(title)
+
+    for section in sections:
+        heading = str(section.get("heading") or "").strip()
+        if not heading:
+            continue
+
+        if lines:
+            lines.append("")
+        lines.append(f"{heading}:")
+
+        content = section.get("content")
+        if isinstance(content, list):
+            for item in content:
+                item_text = str(item).strip()
+                if item_text:
+                    lines.append(f"- {item_text}")
+            continue
+
+        content_text = str(content or "").strip()
+        if content_text:
+            lines.append(content_text)
+
+    return "\n".join(lines).strip()
+
+
+def _safe_datetime_sort_key(value: Optional[datetime]) -> datetime:
+    return value or datetime.min.replace(tzinfo=None)
+
+
+def _extract_customer_name(metadata: Dict[str, Any], phone_number: str, user_id: str) -> str:
+    candidates = [
+        metadata.get("customer_name"),
+        metadata.get("name"),
+        metadata.get("full_name"),
+        metadata.get("user_name"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    if phone_number:
+        return phone_number
+    return f"User {str(user_id or '')[:8]}".strip()
+
+
+def _avatar_from_name(name: str) -> str:
+    parts = [part for part in re.split(r"\s+", (name or "").strip()) if part]
+    if not parts:
+        return "CU"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return f"{parts[0][0]}{parts[1][0]}".upper()
+
+
+def _summarize_preview(messages: List[Dict[str, Any]], fallback_reason: Optional[str]) -> str:
+    for message in reversed(messages):
+        body = str(message.get("body") or "").strip()
+        if body:
+            return body
+    return str(fallback_reason or "Escalated conversation awaiting review.")
+
+
+def _build_event_message(event_type: str, payload: Dict[str, Any], created_at: Optional[datetime]) -> Optional[Dict[str, Any]]:
+    event_type = str(event_type or "").strip()
+    payload = payload or {}
+    body: Optional[str] = None
+
+    if event_type == "escalation_confirmed":
+        reason = payload.get("reason") or payload.get("source")
+        body = "Conversation escalated to a human agent."
+        if reason:
+            body = f"{body} Reason: {reason}."
+    elif event_type == "agent_joined":
+        agent_id = payload.get("agent_id")
+        body = f"Agent {agent_id} joined the conversation." if agent_id else "Agent joined the conversation."
+    elif event_type == "session_end":
+        ended_by = payload.get("ended_by")
+        body = f"Conversation ended by {ended_by}." if ended_by else "Conversation ended."
+
+    if not body:
+        return None
+
+    return {
+        "id": f"event-{event_type}-{int(created_at.timestamp() * 1000) if created_at else '0'}",
+        "sender": "event",
+        "body": body,
+        "timestamp": _iso_or_none(created_at),
+        "meta": event_type,
+        "source": "conversation_event",
+        "metadata": payload,
+    }
+
+
+def _merge_chat_console_messages(session_id: str, conversation_id: Optional[str], db: PostgresDB) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+
+    if conversation_id:
+        try:
+            history = list(reversed(db.get_conversation_history(conversation_id, limit=200)))
+            for msg in history:
+                role = str(getattr(msg, "role", "") or "").lower()
+                sender = "customer" if role == "user" else "ai" if role == "assistant" else "agent" if role == "agent" else role or "event"
+                merged.append(
+                    {
+                        "id": f"db-{getattr(msg, 'id', '')}",
+                        "sender": sender,
+                        "body": getattr(msg, "content", ""),
+                        "timestamp": _iso_or_none(getattr(msg, "timestamp", None)),
+                        "meta": role if role not in {"user", "assistant", "agent"} else None,
+                        "source": "database_message",
+                        "metadata": getattr(msg, "message_metadata", {}) or {},
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Failed to load DB history for chat console session %s: %s", session_id, exc)
+
+        try:
+            events = list(reversed(db.get_conversation_events(conversation_id, limit=100)))
+            for event in events:
+                event_message = _build_event_message(
+                    getattr(event, "event_type", ""),
+                    getattr(event, "payload", {}) or {},
+                    getattr(event, "created_at", None),
+                )
+                if event_message:
+                    merged.append(event_message)
+        except Exception as exc:
+            logger.warning("Failed to load conversation events for chat console session %s: %s", session_id, exc)
+
+    merged.sort(key=lambda item: item.get("timestamp") or "")
+    return merged
+
+
+def _derive_queue_status(escalation: Any) -> str:
+    escalated = bool(getattr(escalation, "escalated", False))
+    ended_at = getattr(escalation, "ended_at", None)
+    agent_id = getattr(escalation, "agent_id", None)
+
+    if ended_at or not escalated:
+        return "resolved"
+    if agent_id:
+        return "active"
+    return "escalated"
+
+
+def _build_chat_console_queue_item(escalation: Any, db: PostgresDB, prior_counts: Dict[str, int]) -> Dict[str, Any]:
+    session_id = str(getattr(escalation, "session_id", "") or "")
+    conversation_id = getattr(escalation, "conversation_id", None)
+    user_id = str(getattr(escalation, "user_id", "") or "")
+    metadata = dict(getattr(escalation, "escalation_metadata", {}) or {})
+
+    conversation = db.get_conversation(conversation_id) if conversation_id and hasattr(db, "get_conversation") else None
+    user = db.get_user_by_id(user_id) if user_id else None
+    phone_number = str(getattr(user, "phone_number", "") or metadata.get("phone_number") or metadata.get("phone") or "")
+    customer_name = _extract_customer_name(metadata, phone_number, user_id)
+    customer_email = str(metadata.get("email") or metadata.get("customer_email") or "")
+    channel = str(metadata.get("channel") or metadata.get("source") or "Chat")
+
+    messages = _merge_chat_console_messages(session_id, conversation_id, db)
+    latest_message_at = None
+    if messages:
+        latest_message_at = max((message.get("timestamp") for message in messages if message.get("timestamp")), default=None)
+    latest_timestamp = (
+        datetime.fromisoformat(latest_message_at) if latest_message_at else None
+        or getattr(conversation, "ended_at", None)
+        or getattr(escalation, "updated_at", None)
+        or getattr(escalation, "agent_joined_at", None)
+        or getattr(escalation, "escalated_at", None)
+        or getattr(conversation, "created_at", None)
+        or getattr(escalation, "created_at", None)
+    )
+
+    return {
+        "sessionId": session_id,
+        "conversationId": conversation_id,
+        "userId": user_id,
+        "name": customer_name,
+        "avatar": _avatar_from_name(customer_name),
+        "status": _derive_queue_status(escalation),
+        "assignee": str(getattr(escalation, "agent_id", None) or "Unassigned"),
+        "mode": str(getattr(conversation, "mode", None) or "conversational"),
+        "customerKycCompleted": bool(getattr(user, "kyc_completed", False)),
+        "memberTier": str(metadata.get("member_tier") or "Customer"),
+        "channel": channel,
+        "phone": phone_number,
+        "email": customer_email,
+        "escalationMetadata": metadata,
+        "journey": ["Waiting", "Escalated", "Active", "Resolved", "Closed"],
+        "summary": {
+            "escalationReason": str(getattr(escalation, "escalation_reason", None) or metadata.get("reason") or "Unspecified"),
+            "context": str(metadata.get("context") or metadata.get("summary") or ""),
+            "priorEscalations": f"{max(prior_counts.get(user_id, 1) - 1, 0)} cases" if user_id else "0 cases",
+            "sentiment": str(metadata.get("sentiment") or "Unknown"),
+        },
+        "preview": _summarize_preview(messages, getattr(escalation, "escalation_reason", None)),
+        "messageCount": len(messages),
+        "createdAt": _iso_or_none(getattr(escalation, "created_at", None)),
+        "updatedAt": _iso_or_none(getattr(escalation, "updated_at", None)),
+        "escalatedAt": _iso_or_none(getattr(escalation, "escalated_at", None)),
+        "agentJoinedAt": _iso_or_none(getattr(escalation, "agent_joined_at", None)),
+        "endedAt": _iso_or_none(getattr(escalation, "ended_at", None)),
+        "conversationCreatedAt": _iso_or_none(getattr(conversation, "created_at", None)),
+        "lastActivityAt": _iso_or_none(latest_timestamp),
+    }
+
+
+def _load_chat_console_queue(db: PostgresDB, limit: int = 100) -> List[Dict[str, Any]]:
+    if not hasattr(db, "list_escalation_sessions"):
+        return []
+
+    escalations = db.list_escalation_sessions(limit=limit)
+    prior_counts: Dict[str, int] = defaultdict(int)
+    for escalation in escalations:
+        user_id = str(getattr(escalation, "user_id", "") or "")
+        if user_id:
+            prior_counts[user_id] += 1
+
+    queue = [_build_chat_console_queue_item(escalation, db, prior_counts) for escalation in escalations]
+    queue.sort(key=lambda item: item.get("lastActivityAt") or "", reverse=True)
+    return queue
+
+
+def _parse_chat_console_activity(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+
+def _filter_chat_console_queue(queue: List[Dict[str, Any]], status_filter: Optional[str], since_days: int) -> List[Dict[str, Any]]:
+    filtered = queue
+    if status_filter:
+        filtered = [item for item in filtered if item.get("status") == status_filter]
+
+    cutoff = datetime.utcnow() - timedelta(days=since_days)
+    return [
+        item
+        for item in filtered
+        if (_parse_chat_console_activity(item.get("lastActivityAt") or item.get("updatedAt") or item.get("createdAt")) or datetime.utcnow()) >= cutoff
+    ]
+
+
+@api_router.get("/sessions/{session_id}/history", tags=["Sessions"])
+async def get_conversation_history(session_id: str, limit: int = 50):
+    try:
+        session = state_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        messages = postgres_db.get_conversation_history(session["conversation_id"], limit=limit)
+        msg_list = [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp.isoformat()} for msg in reversed(messages)]
+        return {"session_id": session_id, "messages": msg_list}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting history: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/admin/chat-console/queue", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
+async def get_chat_console_queue(
+    status: Optional[str] = Query(default=None, description="Filter by waiting, escalated, active, or resolved"),
+    limit: int = Query(default=100, ge=1, le=500),
+    since_days: int = Query(default=30, ge=1, le=365),
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        queue = _load_chat_console_queue(db, limit=limit)
+        queue = _filter_chat_console_queue(queue, status_filter=status, since_days=since_days)
+
+        return {"items": queue, "count": len(queue)}
+    except Exception as e:
+        logger.error(f"Error loading chat console queue: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/admin/chat-console/conversations/{session_id}", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
+async def get_chat_console_conversation(session_id: str, db: PostgresDB = Depends(get_db)):
+    try:
+        queue = _load_chat_console_queue(db, limit=500)
+        conversation = next((item for item in queue if item["sessionId"] == session_id), None)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        messages = _merge_chat_console_messages(session_id, conversation.get("conversationId"), db)
+        return {"conversation": conversation, "messages": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading chat console conversation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/admin/chat-console/conversations/{session_id}/reply", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
+async def send_chat_console_reply(session_id: str, body: ChatConsoleReplyRequest, db: PostgresDB = Depends(get_db)):
+    try:
+        queue = _load_chat_console_queue(db, limit=500)
+        conversation = next((item for item in queue if item["sessionId"] == session_id), None)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        agent_id = (body.agent_id or "agent").strip() or "agent"
+        sender = (body.sender or "agent").strip() or "agent"
+        message_text = body.message.strip()
+
+        state_manager.mark_agent_joined(session_id, agent_id)
+
+        conversation_id = conversation.get("conversationId")
+        if conversation_id:
+            db.add_message(
+                conversation_id=conversation_id,
+                role="agent" if sender == "agent" else sender,
+                content=message_text,
+                metadata={"agent_id": agent_id, "source": "chat_console"},
+            )
+
+        messages = _merge_chat_console_messages(session_id, conversation_id, db)
+        return {"success": True, "response": {"sender": sender, "agent_id": agent_id, "message": message_text}, "messages": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending chat console reply: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/admin/chat-console")
+async def websocket_admin_chat_console(websocket: WebSocket):
+    from src.chatbot.dependencies import get_api_keys
+    import hmac
+
+    api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+    valid_keys = get_api_keys()
+    api_key_candidate = (api_key or "").strip()
+    api_key_ok = bool(api_key_candidate) and any(hmac.compare_digest(api_key_candidate, key) for key in valid_keys)
+    if not api_key_ok:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    auth_header = (websocket.headers.get("authorization") or "").strip()
+    access_token = websocket.query_params.get("access_token")
+    if auth_header.lower().startswith("bearer ") and not access_token:
+        access_token = auth_header.split(" ", 1)[1].strip()
+
+    claims = verify_admin_access_token(access_token or "")
+    if not claims:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await websocket.accept()
+
+    current_status: Optional[str] = None
+    current_since_days: int = 30
+    current_limit: int = 80
+    selected_session_id: Optional[str] = None
+    last_queue_signature: Optional[str] = None
+    last_conversation_signature: Optional[str] = None
+
+    def _normalize_status(value: Any) -> Optional[str]:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"active", "waiting", "escalated", "resolved"}:
+            return candidate
+        return None
+
+    def _normalize_int(value: Any, default: int, min_value: int, max_value: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, parsed))
+
+    while True:
+        try:
+            incoming: Optional[Dict[str, Any]] = None
+            try:
+                incoming = await asyncio.wait_for(websocket.receive_json(), timeout=1.5)
+            except asyncio.TimeoutError:
+                incoming = None
+
+            if incoming and isinstance(incoming, dict):
+                msg_type = str(incoming.get("type") or "").strip().lower()
+
+                if msg_type in {"subscribe", "set_filter"}:
+                    current_status = _normalize_status(incoming.get("status"))
+                    current_since_days = _normalize_int(incoming.get("sinceDays"), default=30, min_value=1, max_value=365)
+                    current_limit = _normalize_int(incoming.get("limit"), default=80, min_value=1, max_value=500)
+                    session_id = str(incoming.get("sessionId") or "").strip()
+                    if session_id:
+                        selected_session_id = session_id
+                elif msg_type == "select_conversation":
+                    session_id = str(incoming.get("sessionId") or "").strip()
+                    selected_session_id = session_id or None
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                elif msg_type:
+                    await websocket.send_json({"type": "error", "message": f"Unsupported message type: {msg_type}"})
+
+            queue = _load_chat_console_queue(postgres_db, limit=current_limit)
+            queue = _filter_chat_console_queue(queue, status_filter=current_status, since_days=current_since_days)
+
+            queue_payload: Dict[str, Any] = {
+                "type": "queue_snapshot",
+                "items": queue,
+                "count": len(queue),
+                "status": current_status,
+                "sinceDays": current_since_days,
+                "limit": current_limit,
+            }
+            queue_signature = json.dumps(queue_payload, sort_keys=True, default=str)
+            if queue_signature != last_queue_signature:
+                await websocket.send_json(queue_payload)
+                last_queue_signature = queue_signature
+
+            if selected_session_id:
+                conversation = next((item for item in queue if item.get("sessionId") == selected_session_id), None)
+                if not conversation:
+                    missing_payload = {"type": "conversation_missing", "sessionId": selected_session_id}
+                    missing_signature = json.dumps(missing_payload, sort_keys=True, default=str)
+                    if missing_signature != last_conversation_signature:
+                        await websocket.send_json(missing_payload)
+                        last_conversation_signature = missing_signature
+                else:
+                    messages = _merge_chat_console_messages(selected_session_id, conversation.get("conversationId"), postgres_db)
+                    conversation_payload: Dict[str, Any] = {
+                        "type": "conversation_snapshot",
+                        "sessionId": selected_session_id,
+                        "conversation": conversation,
+                        "messages": messages,
+                    }
+                    conversation_signature = json.dumps(conversation_payload, sort_keys=True, default=str)
+                    if conversation_signature != last_conversation_signature:
+                        await websocket.send_json(conversation_payload)
+                        last_conversation_signature = conversation_signature
+        except WebSocketDisconnect:
+            break
+        except Exception as e:
+            logger.error("Chat console websocket error: %s", e, exc_info=True)
+            with suppress(Exception):
+                await websocket.send_json({"type": "error", "message": "Live chat console stream failed."})
+            break
+
+
+@api_router.delete("/sessions/{session_id}", tags=["Sessions"])
+async def end_session(session_id: str, ended_by: str = "user"):
+    try:
+        state_manager.end_session(session_id, ended_by=ended_by)
+        return {"message": "Session ended successfully"}
+    except Exception as e:
+        logger.error(f"Error ending session: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# API versioning: expose routes under /api/v1
+app.include_router(api_router, prefix="/api/v1")
+
+
+def _strip_heading_from_text(text: str, heading: str) -> str:
+    if not text or not heading:
+        return text
+    t, h = text.strip(), heading.strip()
+    if not h:
+        return text
+    if t.lower().startswith(h.lower()):
+        rest = t[len(h):].lstrip("\n\t ")
+        if rest.upper().startswith("A:") and "Q:" in t[:4]:
+            rest = rest[2:].lstrip()
+        return rest if rest else t
+    q_prefix = "Q: " + h
+    if t.lower().startswith(q_prefix.lower()):
+        after = t[len(q_prefix):].lstrip()
+        if after.upper().startswith("A:"):
+            return after[2:].lstrip()
+        return after
+    return text
+
+
+def _load_product_sections(product_id: str) -> Dict[str, List[Dict[str, str]]]:
+    chunks_path = Path(__file__).parent.parent.parent / "data" / "processed" / "website_chunks.jsonl"
+    if not chunks_path.exists():
+        raise HTTPException(status_code=500, detail="Product chunks file not found")
+
+    sections: Dict[str, List[Dict[str, str]]] = {}
+    with open(chunks_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            data = json.loads(line)
+            if data.get("type") != "product":
+                continue
+            if data.get("doc_id") != product_id:
+                continue
+            ctype = data.get("chunk_type") or "general"
+            heading = data.get("section_heading") or ""
+            raw_text = data.get("text") or ""
+            text = _strip_heading_from_text(raw_text, heading)
+            entry = {"heading": heading, "text": text}
+            sections.setdefault(ctype, []).append(entry)
+    return sections
+
+
+# ============================================================================
+# STARTUP/SHUTDOWN EVENTS
+# ============================================================================
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting Old Mutual Chatbot API...")
+    db_url = os.getenv("DATABASE_URL", "")
+    runtime_summary = runtime_service_summary()
+    if db_url:
+        try:
+            parsed = urlparse(db_url)
+            query = parse_qs(parsed.query or "")
+            logger.info(
+                "DATABASE_URL target: scheme=%s host=%s port=%s db=%s "
+                "sslmode=%s channel_binding=%s requested_postgres=%s "
+                "effective_postgres=%s in_container=%s",
+                parsed.scheme,
+                parsed.hostname,
+                parsed.port or 5432,
+                (parsed.path or "").lstrip("/"),
+                (query.get("sslmode") or [""])[0],
+                (query.get("channel_binding") or [""])[0],
+                os.getenv("USE_POSTGRES_CONVERSATIONS", ""),
+                runtime_summary["use_real_postgres"],
+                runtime_summary["running_in_container"],
+            )
+        except Exception as e:
+            logger.warning("Could not parse DATABASE_URL for startup logging: %s", e)
+    else:
+        logger.info("DATABASE_URL not set; using in-memory PostgresDB stub")
+
+    redis_url = os.getenv("REDIS_URL", "")
+    if redis_url:
+        logger.info(
+            "REDIS_URL target host=%s effective_redis=%s",
+            runtime_summary["redis_host"],
+            runtime_summary["use_real_redis"],
+        )
+
+    logger.info("Database schema initialization is managed by Alembic migrations")
+
+    if redis_cache.ping():
+        logger.info("Redis connection successful")
+    else:
+        logger.warning("Redis connection failed")
+
+    if _heartbeat_enabled():
+        app.state.heartbeat_stop_event = asyncio.Event()
+        app.state.heartbeat_task = asyncio.create_task(_service_heartbeat_loop(app.state.heartbeat_stop_event))
+        logger.info("Service heartbeat emitter started (interval=%ss)", _heartbeat_interval_seconds())
+    else:
+        app.state.heartbeat_stop_event = None
+        app.state.heartbeat_task = None
+        logger.info("Service heartbeat emitter disabled")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down Old Mutual Chatbot API...")
+    stop_event = getattr(app.state, "heartbeat_stop_event", None)
+    heartbeat_task = getattr(app.state, "heartbeat_task", None)
+    if stop_event is not None:
+        stop_event.set()
+    if heartbeat_task is not None:
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task

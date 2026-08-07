@@ -1,0 +1,17 @@
+-r requirements.txt
+
+# Development tools
+black==26.3.1
+flake8==6.1.0
+mypy==1.7.1
+isort==5.13.2
+pre-commit==3.6.0
+
+# Jupyter
+jupyter==1.0.0
+ipykernel==6.27.1
+notebook==7.0.6
+
+# Documentation
+sphinx==7.2.6
+sphinx-rtd-theme==2.0.0

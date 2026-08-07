@@ -1,0 +1,8 @@
+{
+  "definition": "This is a test product created to verify JSON generation and paths.",
+  "benefits": [
+    "Test benefit 1",
+    "Test benefit 2"
+  ],
+  "eligibility": "Anyone can see this product."
+}

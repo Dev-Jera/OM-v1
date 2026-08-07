@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: rag-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user} -d ${POSTGRES_DB:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    container_name: rag-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: rag-api
+    env_file:
+      - .env
+    environment:
+      # DATABASE_URL comes from .env; do not rebuild from POSTGRES_* here
+      # because special characters in passwords must remain URL-encoded.
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      USE_POSTGRES_CONVERSATIONS: ${USE_POSTGRES_CONVERSATIONS:-true}
+      USE_ALEMBIC_MIGRATIONS: ${USE_ALEMBIC_MIGRATIONS:-true}
+      RUN_PDF_CATALOGUE_INGEST_ON_START: ${RUN_PDF_CATALOGUE_INGEST_ON_START:-true}
+      PDF_CATALOGUE_PATH: ${PDF_CATALOGUE_PATH:-data/raw/pdf/Insurance Product Catalogue (1).pdf}
+      FAIL_ON_PDF_CATALOGUE_INGEST_ERROR: ${FAIL_ON_PDF_CATALOGUE_INGEST_ERROR:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:

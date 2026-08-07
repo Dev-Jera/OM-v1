@@ -1,0 +1,71 @@
+name: Data Pipeline
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Build runtime RAG config for Qdrant
+      env:
+        QDRANT_HOST: ${{ secrets.QDRANT_HOST }}
+        QDRANT_PORT: ${{ secrets.QDRANT_PORT }}
+        QDRANT_COLLECTION: ${{ secrets.QDRANT_COLLECTION }}
+      run: |
+        set -euo pipefail
+        if [ -z "${QDRANT_HOST:-}" ]; then
+          echo "QDRANT_HOST secret is required" >&2
+          exit 1
+        fi
+        cat > config/rag_config.pipeline.yml <<EOF
+        embeddings:
+          provider: gemini
+          model: models/gemini-embedding-001
+          output_dimensionality: 1536
+        vector_store:
+          provider: qdrant_http
+          collection: ${QDRANT_COLLECTION:-old_mutual_chunks}
+          host: ${QDRANT_HOST}
+          port: ${QDRANT_PORT:-6333}
+        retrieval:
+          top_k: 5
+          hybrid:
+            enabled: true
+            dense_weight: 0.7
+            sparse_weight: 0.3
+        generation:
+          enabled: true
+          backend: gemini
+          model: gemini-2.5-flash
+          api_key_env: GEMINI_API_KEY
+        EOF
+
+    - name: Run pipeline
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: |
+        set -euo pipefail
+        if [ -z "${GEMINI_API_KEY:-}" ]; then
+          echo "GEMINI_API_KEY secret is required" >&2
+          exit 1
+        fi
+        python scripts/run_scraping.py
+        python scripts/run_processing.py --latest
+        python scripts/generate_embeddings.py \
+          --config config/rag_config.pipeline.yml \
+          --chunks-file data/processed/website_chunks.jsonl

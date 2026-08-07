@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "old-mutual-zoho-rag"
+version = "0.1.0"
+description = "Hybrid RAG system for Old Mutual Uganda Zoho ecosystem"
+authors = ["Old Mutual Uganda "]
+
+[tool.black]
+line-length = 160
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "-v --cov=src --cov-report=html"
+asyncio_mode = "auto"

@@ -1,0 +1,96 @@
+scrapers:
+  website:
+    base_url: "https://www.oldmutual.co.ug"
+    output_dir: "data/raw/website"
+    delay: 2.0
+    max_retries: 3
+    
+    priority_urls:
+      - "/personal/save-and-invest/somesa-education-plan"
+      - "/personal/save-and-invest/sure-deal-savings-plan"
+      - "/personal/save-and-invest/dollar-unit-trust-fund"
+      - "/personal/save-and-invest/private-wealth-management"
+      - "/personal/insure/personal-accident"
+      - "/personal/insure/serenicare"
+      - "/personal/insure/professional-liability"
+      - "/personal/insure/family-life-protection"
+      - "/personal/insure/travel-sure-plus-insurance"
+      - "/personal/insure/domestic-package"
+      - "/personal/insure/motor-private-insurance"
+      - "/personal/insure/motor-comesa-insurance"
+      - "/business/investment-and-advisory"
+      - "/business/office-compact"
+      - "/business/sme-medical-cover"
+      - "/business/sme-life-pack"
+      - "/business/group-life-cover"
+      - "/business/group-medical-standard"
+      - "/business/group-personal-accident"
+      - "/business/credit-life-cover"
+      - "/business/combined-solutions"
+      - "/business/umbrella-pension-scheme"
+      - "/business/group-last-expense"
+      - "/business/fidelity-guarantee"
+      - "/business/bankers-blanket-bond"
+      - "/business/livestock"
+      - "/business/public-liability"
+      - "/business/crop-insurance"
+      - "/business/carriers-liability"
+      - "/business/directors-and-officers-liability"
+      - "/business/motor-commercial"
+      - "/business/marine-open-cover"
+      - "/business/marine-hull"
+      - "/business/marine-cargo"
+      - "/business/goods-in-transit"
+      - "/business/industrial-all-risk"
+      - "/business/all-risks"
+      - "/business/burglary"
+      - "/business/business-interruption"
+      - "/business/fire-and-special-perils"
+      - "/business/money-guarantee"
+      - "/business/product-liability"
+      - "/investment/unit-trusts/money-market-fund"
+      - "/investment/unit-trusts/umbrella-trust-fund"
+      - "/investment/unit-trusts/balanced-fund"
+      - "/investment/unit-trusts/dollar-unit-trust-fund"
+      - "/investment/securities-trading"
+      - "/investment/securities-trading/"
+      - "/app/public/motor-insurance"
+    
+    article_urls:
+      - "/personal/safety-and-security"
+      - "/personal/safety-and-security/ensure-your-children-are-safe-online"
+      - "/personal/safety-and-security/mobile-device-security"
+      - "/personal/safety-and-security/debit-order-scams"
+      - "/personal/safety-and-security/online-shopping-scams"
+      - "/personal/safety-and-security/whatsapp-scams"
+      - "/personal/safety-and-security/cyber-crime"
+      - "/personal/safety-and-security/419-scams"
+      - "/personal/safety-and-security/messaging-cash-send-scams"
+      - "/personal/safety-and-security/-phishing-vishing-and-smishing-scams"
+      - "/personal/safety-and-security/identity-theft"
+      - "/personal/safety-and-security/business-email-compromise"
+      - "/personal/safety-and-security/bank-details-update-scam"
+      - "/personal/safety-and-security/tech-support-scams"
+      - "/personal/safety-and-security/social-engineering"
+      - "/personal/safety-and-security/money-laundering-scams"
+      - "/personal/safety-and-security/sim-swaps-and-number-porting"
+    
+    info_page_urls:
+      about_us:
+        - "/about-us"
+        - "/about-us/leadership"
+        - "/about-us/financials"
+        - "/about-us/how-we-give-back"
+        - "/about-us/media-centre"
+      other:
+        - "/get-help"
+  pdf:
+    input_dir: "data/raw/pdfs"
+    output_dir: "data/raw/pdf_content"
+    extract_tables: true
+
+general:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  rate_limit:
+    enabled: true
+    requests_per_minute: 30

@@ -1,0 +1,48 @@
+Frontend -> Backend API Key setup (X-API-KEY)
+
+Backend behavior
+- Backend expects a request header: X-API-KEY: <key>
+- Backend reads allowed keys from backend .env:
+  API_KEYS=key1,key2,key3
+- Verification happens in src/chatbot/dependencies.py (api_key_protection):
+  - If header missing/invalid => 401 Unauthorized
+  - If valid => request continues to the endpoint handler
+- Some paths may be allowlisted (e.g. /health, /docs, /openapi.json).
+
+Frontend (Axios + Vite) setup
+1) Add a frontend env var (Vite exposes VITE_* at build time)
+   In your frontend .env (or .env.production):
+     VITE_API_KEY=your_api_key_here
+     VITE_API_BASE_URL=https://your-domain/api/v1
+
+2) Configure Axios to include the header on every request
+   Example:
+     import axios from "axios";
+
+     export const api = axios.create({
+       baseURL: import.meta.env.VITE_API_BASE_URL,
+       headers: {
+         "Content-Type": "application/json",
+         "X-API-KEY": import.meta.env.VITE_API_KEY,
+       },
+     });
+
+Alternative (interceptor)
+- If you prefer:
+    api.interceptors.request.use((config) => {
+      config.headers = config.headers || {};
+      config.headers["X-API-KEY"] = import.meta.env.VITE_API_KEY;
+      return config;
+    });
+
+Testing
+- Without header => 401 on protected endpoints
+- With header => 200 + JSON
+
+Important note
+- A frontend-shipped API key is not a true secret (users can extract it).
+- For strong security, use proper user authentication (JWT/OAuth) or a backend-to-backend key.
+
+CI / Lint note
+- tests/test_flows.py uses a small sys.path bootstrap for imports, so some imports are marked with "# noqa: E402" to satisfy flake8.
+
