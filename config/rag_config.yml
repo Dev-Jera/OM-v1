@@ -13,7 +13,7 @@ embeddings:
 
 vector_store:
   provider: qdrant_http   # pgvector | qdrant_local | qdrant_http
-  collection: old_mutual_chunks
+  collection: Mia-chatbot
   # pgvector: uses DATABASE_URL from environment
   # qdrant_local: path: data/qdrant
   # qdrant_http: host/port below (local/docker-compose)
