@@ -20,8 +20,8 @@ data
 !.env.example
 
 tests
-premium_mocks
-underwriting_mocks
+/premium_mocks
+/underwriting_mocks
 
 agent_chat_ui.html
 agent_chat_poll.js

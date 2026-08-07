@@ -29,7 +29,7 @@ data/embeddings/*
 !data/*/sample/
 
 # Mock/generated artifacts (recreated at runtime)
-underwriting_mocks/
+/underwriting_mocks/
 quote_downloads/
 
 # Logs
