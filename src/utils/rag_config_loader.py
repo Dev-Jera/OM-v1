@@ -92,30 +92,35 @@ def load_rag_config(config_path: Optional[Path] = None) -> RAGConfig:
 
 
 def _apply_env_overrides(cfg: RAGConfig) -> None:
-    """Apply environment variable overrides onto a loaded RAGConfig in place."""
+    """Apply environment variable overrides onto a loaded RAGConfig in place.
+
+    Values are stripped so accidental surrounding whitespace (e.g. a trailing
+    newline in QDRANT_API_KEY) never reaches the vector store client, where it
+    would produce invalid HTTP headers.
+    """
     provider = os.environ.get("RAG_VECTOR_PROVIDER")
     if provider:
-        cfg.vector_store.provider = provider
+        cfg.vector_store.provider = provider.strip()
 
     embeddings_provider = os.environ.get("RAG_EMBEDDINGS_PROVIDER")
     if embeddings_provider:
-        cfg.embeddings.provider = embeddings_provider
+        cfg.embeddings.provider = embeddings_provider.strip()
 
     url = os.environ.get("QDRANT_URL")
     if url:
-        cfg.vector_store.url = url
+        cfg.vector_store.url = url.strip()
 
     api_key = os.environ.get("QDRANT_API_KEY")
     if api_key:
-        cfg.vector_store.api_key = api_key
+        cfg.vector_store.api_key = api_key.strip()
 
     collection = os.environ.get("QDRANT_COLLECTION")
     if collection:
-        cfg.vector_store.collection = collection
+        cfg.vector_store.collection = collection.strip()
 
     host = os.environ.get("QDRANT_HOST")
     if host:
-        cfg.vector_store.host = host
+        cfg.vector_store.host = host.strip()
 
     port = os.environ.get("QDRANT_PORT")
     if port:
