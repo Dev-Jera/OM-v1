@@ -20,12 +20,20 @@ def state_manager():
     return DummyStateManager()
 
 
-def test_incomplete_input_asks_clarifier(state_manager):
+def test_short_input_returns_model_answer(state_manager):
+    # Short/vague inputs are judged by the LLM, not short-circuited with a
+    # clarifying question, so the generated answer must be returned as-is.
     rp = ResponseProcessor(state_manager=state_manager)
     session = {}
-    out = rp.process_response(raw_response="", user_input="Hi", confidence=0.9, conversation_state=session, session_id="s1")
-    assert out["follow_up"] is True
-    assert "provide more details" in out["message"].lower()
+    out = rp.process_response(
+        raw_response="Hi there! I'm MIA, your Old Mutual assistant.",
+        user_input="Hi",
+        confidence=0.9,
+        conversation_state=session,
+        session_id="s1",
+    )
+    assert out["follow_up"] is False
+    assert out["message"] == "Hi there! I'm MIA, your Old Mutual assistant."
 
 
 def test_low_confidence_triggers_clarification(state_manager):
@@ -48,13 +56,13 @@ def test_followup_detected_from_model(state_manager):
 
 
 def test_error_handler_on_exception(monkeypatch):
-    # force an exception deep in the processor
+    # force an exception deep in the processor (low-confidence path)
     def bad_create(*a, **k):
         raise RuntimeError("boom")
 
     monkeypatch.setattr("src.followup_manager.FollowUpManager.create_clarifying_question", bad_create)
     rp = ResponseProcessor()
     session = {}
-    out = rp.process_response(raw_response="ok", user_input="x", confidence=0.9, conversation_state=session)
+    out = rp.process_response(raw_response="ok", user_input="x", confidence=0.1, conversation_state=session)
     assert out["fallback"] is True
     assert "internal error" in out["message"].lower() or "error" in out["metadata"]["error"].lower()

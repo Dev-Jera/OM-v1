@@ -441,12 +441,23 @@ class ConversationalBrain:
                 "\n\nThe user is responding to your quotation offer. Decide if they want to "
                 "proceed, then reply accordingly."
             )
-        return {
+        cfg: Dict[str, Any] = {
             "system_instruction": system,
             "temperature": 0.3,
             "max_output_tokens": 1200,
             "tools": _TOOLS,
         }
+        # The brain runs its own function-call loop, so disable the SDK's
+        # built-in Automatic Function Calling (AFC). Otherwise it can interfere
+        # with the manual tool loop (and emits noisy "AFC is enabled" logs).
+        try:
+            from google.genai import types
+
+            if hasattr(types, "AutomaticFunctionCallingConfig"):
+                cfg["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
+        except Exception:  # pragma: no cover - depends on SDK version
+            pass
+        return cfg
 
     def _confirmation_config(self) -> Any:
         return {

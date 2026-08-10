@@ -31,5 +31,12 @@ else
   echo "[startup] RUN_PDF_CATALOGUE_INGEST_ON_START=false, skipping PDF ingestion."
 fi
 
+echo "[startup] Building BM25 keyword index..."
+if python scripts/build_bm25_index.py; then
+  echo "[startup] BM25 index ready."
+else
+  echo "[startup] BM25 index build skipped/failed (non-fatal)."
+fi
+
 echo "[startup] Starting API server..."
 exec uvicorn src.api.main:app --host 0.0.0.0 --port 8000

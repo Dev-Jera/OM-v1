@@ -133,8 +133,6 @@ async def api_key_protection(
     websocket: WebSocket = None,
     x_api_key: str = Header(default=None, alias="X-API-KEY"),
 ):
-    # DEBUG: print what FastAPI sees
-    print("DEBUG: Received API Key from header:", x_api_key)
     debug = os.getenv("API_KEY_DEBUG", "").lower() in ("1", "true", "yes")
     active_scope = request if request is not None else websocket
     path = active_scope.url.path if active_scope is not None else "<no-request>"

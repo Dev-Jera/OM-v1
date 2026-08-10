@@ -18,7 +18,6 @@ class ResponseProcessor:
 
     Responsibilities:
     - Detect follow-up questions contained in the model response.
-    - Detect incomplete or ambiguous user input and ask clarifying questions.
     - Trigger fallback handling when confidence is low or no useful answer exists.
     - Normalize final output to a consistent dict the rest of the app can consume.
 
@@ -79,8 +78,6 @@ class ResponseProcessor:
         """Return a normalized dict with keys: message, follow_up (optional), fallback (optional), metadata.
 
         If state_manager and session_id are provided follow-ups will be queued into the persistent session store.
-        When products_matched is provided (e.g. ["Serenicare"]), short queries that match a product name
-        are not treated as incomplete, so the RAG answer is returned instead of a clarifying question.
         """
         try:
             logger.debug("Processing response: confidence=%s, user_input=%s", confidence, user_input)
@@ -102,30 +99,6 @@ class ResponseProcessor:
                 if self.state_manager and session_id:
                     self.state_manager.update_session(session_id, {"fallbacks": conversation_state.get("fallbacks", [])})
                 return payload
-
-            # If user input looks incomplete, ask a clarifying question — unless the query
-            # matches a product we already resolved (e.g. user typed "serenicare" and we have Serenicare).
-            # Also skip this check if products_matched list is populated, since that means we found relevant products.
-            has_matched_products = products_matched is not None and len(products_matched) > 0
-            query_matches = self._query_matches_product(user_input, products_matched)
-
-            if self._is_incomplete_input(user_input) and not has_matched_products and not query_matches:
-                logger.info(
-                    "Incomplete input detected: user_input='%s', has_products=%s, query_matches=%s",
-                    user_input, has_matched_products, query_matches
-                )
-                question = self.followup_manager.create_clarifying_question(user_input)
-                # Persist followup in session if possible
-                if self.state_manager and session_id:
-                    self.followup_manager.queue_followup_session(session_id, self.state_manager, question)
-                else:
-                    self.followup_manager.queue_followup(conversation_state, question)
-                return {
-                    "message": question,
-                    "follow_up": True,
-                    "fallback": False,
-                    "metadata": {"reason": "incomplete_input"},
-                }
 
             # Low confidence => ask a clarification question instead of fallback.
             if confidence is not None and confidence < self.confidence_threshold:

@@ -80,7 +80,9 @@ async def test_legacy_path_used_when_no_brain():
     out = await conv.process("hello there", session_id, "1")
 
     assert out["mode"] == "conversational"
-    assert "LEGACY" not in (out.get("response") or "")
+    # No brain attached -> legacy RAG path answers; the DummyRAG mock tags its
+    # answer with "LEGACY:" to prove the legacy path was used (not the brain).
+    assert "LEGACY" in (out.get("response") or "")
     assert out.get("brain") is not True
 
 

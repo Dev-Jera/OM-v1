@@ -34,7 +34,7 @@ class BM25KeywordSearch:
         self.bm25: Optional[BM25Okapi] = None
         self.chunk_ids: List[str] = []
         self.chunk_metadata: Dict[str, Dict[str, Any]] = {}
-        self.index_path = index_path or Path("data/embeddings/bm25_index.pkl")
+        self.index_path = index_path or Path(__file__).resolve().parents[2] / "data" / "embeddings" / "bm25_index.pkl"
         self.synonym_expander = SynonymExpander() if use_synonyms else None
 
     def build_index(self, chunks_file: Path) -> int:

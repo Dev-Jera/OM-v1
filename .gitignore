@@ -24,6 +24,7 @@ secrets/
 data/raw/*
 data/processed/*
 !data/processed/website_documents.jsonl
+!data/processed/website_chunks.jsonl
 data/embeddings/*
 !data/*/.gitkeep
 !data/*/sample/

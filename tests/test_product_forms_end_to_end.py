@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from fastapi.testclient import TestClient
 
 from src.api.main import app
@@ -67,7 +69,7 @@ def test_motor_private_full_form_creates_quote():
                 "coverType": "comprehensive",
                 "vehicleMake": "Toyota",
                 "yearOfManufacture": 2020,
-                "coverStartDate": "2026-04-15",
+                "coverStartDate": (date.today() + timedelta(days=7)).isoformat(),
                 "isRareModel": "no",
                 "hasUndergoneValuation": "yes",
                 "vehicleValueUgx": 45000000
