@@ -382,6 +382,7 @@ class PersonalAccidentFlow:
                 "download_option": True,
                 "download_label": "Download Quote (PDF)",
                 "actions": [
+                    {"type": "download_quote", "label": "Download Quote (PDF)"},
                     {"type": "edit", "label": "Edit Quote"},
                     {"type": "proceed_to_details", "label": "Proceed with this quote to buy"},
                 ],
@@ -397,6 +398,7 @@ class PersonalAccidentFlow:
         )
         quote_id = quote_result["quote_id"]
         if quote_id:
+            data["quote_id"] = quote_id
             resp["response"]["quote_id"] = quote_id
             resp["response"]["download_url"] = quote_result["download_url"]
 
