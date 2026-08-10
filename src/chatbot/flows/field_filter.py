@@ -132,9 +132,9 @@ def add_frontend_validation_rules(fields: List[Dict[str, Any]]) -> List[Dict[str
 
         # National ID Number (NIN) - Uganda format
         if "national_id" in field_name.lower() or "nin" in field_name.lower():
-            validation["pattern"] = r"^[A-Z]{2}\d{12}$"
-            validation["patternMessage"] = "NIN must be 2 letters followed by 12 digits (e.g., CM1234567890AB)"
-            field_copy["placeholder"] = field_copy.get("placeholder", "CM1234567890AB")
+            validation["pattern"] = r"^[A-Z]{2}[A-Z0-9]{12}$"
+            validation["patternMessage"] = "NIN must be 14 characters: 2 letters followed by 12 letters/digits (e.g., CF12345678AB90)"
+            field_copy["placeholder"] = field_copy.get("placeholder", "CF12345678AB90")
             field_copy["maxLength"] = 14
 
         # Phone number - Uganda format

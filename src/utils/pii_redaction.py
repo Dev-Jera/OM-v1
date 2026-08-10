@@ -38,8 +38,8 @@ _PHONE_RE = re.compile(
     r"0[0-8]\d{2}[\s\-]?\d{3}[\s\-]?\d{3})"
 )
 
-# Ugandan national ID / NIN: 2 letters + 10 digits + 2 letters, e.g. CF1234567890XY
-_NIN_RE = re.compile(r"\b[A-Z]{2}\d{10}[A-Z]{2}\b")
+# Ugandan national ID / NIN: 14 chars, 2 letters + 12 alphanumerics, e.g. CF12345678AB90
+_NIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{12}\b")
 
 # Passport-style numbers: one letter followed by 7-8 digits, e.g. B1234567
 _PASSPORT_RE = re.compile(r"\b[A-Z]\d{7,8}\b")

@@ -163,8 +163,9 @@ def validate_phone_ug(value: str, errors: Dict[str, str], field: str = "phone_nu
     return raw
 
 
-# Accept both modern and legacy NIN variants used by existing clients.
-_NIN_RE = re.compile(r"^(?:[A-Z]{2}\d{12}|[A-Z]{2}\d{10}[A-Z]{2})$")
+# Uganda NIN: exactly 14 chars - 2 leading letters (e.g. CM citizen male,
+# CF citizen female) followed by 12 alphanumeric characters (e.g. CF12345678AB90).
+_NIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{12}$")
 
 
 def normalize_nin(value: str) -> str:

@@ -353,7 +353,7 @@ class FieldValidator:
         raw = _strip(value)
         if not raw:
             return "National ID Number is required." if required else None
-        if not re.match(r"^(?:[A-Z]{2}\d{12}|[A-Z]{2}\d{10}[A-Z]{2})$", normalize_nin(raw)):
+        if not re.match(r"^[A-Z]{2}[A-Z0-9]{12}$", normalize_nin(raw)):
             return "NIN format is not valid."
         return None
 
@@ -648,9 +648,9 @@ class FieldDecorator:
         hint: Dict[str, Any] = {}
 
         if name in ("national_id_number", "nok_id_number"):
-            hint["pattern"] = r"^(?:[A-Z]{2}\d{12}|[A-Z]{2}\d{10}[A-Z]{2})$"
-            hint["patternMessage"] = "Use a valid NIN format"
-            f.setdefault("placeholder", "CM123456789012")
+            hint["pattern"] = r"^[A-Z]{2}[A-Z0-9]{12}$"
+            hint["patternMessage"] = "NIN must be 14 characters: 2 letters followed by 12 letters/digits (e.g. CF12345678AB90)"
+            f.setdefault("placeholder", "CF12345678AB90")
             f["maxLength"] = 14
 
         elif ftype == "tel" or any(k in name for k in ("phone", "mobile")):
