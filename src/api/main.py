@@ -1809,6 +1809,28 @@ async def api_send_message(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
+async def api_chat(
+    request: ChatMessage,
+    router: ChatRouter = Depends(get_router),
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        return await _handle_chat_message(request, router, db)
+    except FormValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": e.message,
+                "field_errors": e.field_errors,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     from src.chatbot.dependencies import get_api_keys
