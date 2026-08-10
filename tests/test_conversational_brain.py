@@ -221,3 +221,70 @@ async def test_empty_reply_returns_none():
     brain = make_brain(llm, retriever)
 
     assert await brain.converse("hello") is None
+
+
+@pytest.mark.asyncio
+async def test_truncated_reply_requests_continuation():
+    retriever = RecordingRetriever()
+    llm = ScriptedLLM(
+        [
+            FakeResponse(
+                [
+                    text_part(
+                        "I understand you're having trouble logging into your self-service portal "
+                        "for the Unit Trust. Our available information doesn't specifically detail "
+                        "how to fix login problems. However"
+                    )
+                ]
+            ),
+            FakeResponse([text_part(" here are the steps to access your portal.")]),
+        ]
+    )
+    brain = make_brain(llm, retriever)
+
+    result = await brain.converse("how do i log into the unit trust portal")
+
+    assert result is not None
+    assert len(llm.calls) == 2
+    assert "steps to access" in result.reply
+    assert "available information" not in result.reply
+    assert not result.reply.rstrip().endswith("However")
+
+
+@pytest.mark.asyncio
+async def test_complete_reply_does_not_trigger_continuation():
+    retriever = RecordingRetriever()
+    llm = ScriptedLLM(
+        [FakeResponse([text_part("You can fund the Balanced Fund by direct debit, M-Pesa, cheque, or standing order.")])]
+    )
+    brain = make_brain(llm, retriever)
+
+    result = await brain.converse("how can i fund the balanced fund")
+
+    assert result is not None
+    assert len(llm.calls) == 1
+    assert "direct debit" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_meta_lead_in_stripped_from_reply():
+    retriever = RecordingRetriever()
+    llm = ScriptedLLM(
+        [
+            FakeResponse(
+                [
+                    text_part(
+                        "Our available information doesn't specifically detail that. However, you "
+                        "can fund the Balanced Fund by direct debit."
+                    )
+                ]
+            )
+        ]
+    )
+    brain = make_brain(llm, retriever)
+
+    result = await brain.converse("can i fund via m-pesa")
+
+    assert result is not None
+    assert "available information" not in result.reply
+    assert result.reply.startswith("You can fund the Balanced Fund")

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.utils.pii_redaction import clean_history, redact_history, redact_text
+from src.utils.response_safety import looks_truncated, merge_continuation, strip_meta_lead_in
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,12 @@ INSIDER VOICE:
 - Reply like a seasoned Old Mutual product specialist: confident, warm, and knowledgeable.
   State facts plainly as product knowledge.
 - NEVER mention or hint at how you get your information. Never use phrases like
-  "retrieved information", "knowledge base", "search results", "sources", "documents",
-  "according to our data/records", "the tool returned", or "I couldn't find". Your
-  knowledge is simply your knowledge.
+  "retrieved information", "available information", "the information available",
+  "knowledge base", "search results", "sources", "documents", "according to our
+  data/records", "the tool returned", "I couldn't find", "no information", or
+  "doesn't specifically detail". Your knowledge is simply your knowledge.
+- NEVER open a reply by describing what information is or isn't available. Acknowledge
+  the user's question and answer it directly from the first sentence.
 - Never hedge with phrases like "the retrieved information doesn't state...". If a
   detail is genuinely not covered, say so naturally like an insider, e.g. "That specific
   detail isn't covered in our published guide - let me connect you with an agent who can
@@ -320,6 +324,45 @@ class ConversationalBrain:
             logger.warning("Knowledge base retrieval failed: %s", exc)
             return []
 
+    @staticmethod
+    def _was_truncated(response: Any, text: str) -> bool:
+        """True when the LLM reported a token-limit cut-off or the text reads as cut off."""
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                finish_reason = getattr(candidates[0], "finish_reason", None)
+                # Gemini SDK may return an enum or a plain int; MAX_TOKENS = 2.
+                finish_reason_val = getattr(finish_reason, "value", finish_reason)
+                if finish_reason_val == 2:
+                    return True
+        except Exception:  # pragma: no cover - depends on SDK shape
+            pass
+        return looks_truncated(text)
+
+    async def _ensure_complete(
+        self, response: Any, contents: List[Dict[str, Any]], config: Any, text: str
+    ) -> str:
+        """Request one continuation round when the reply was cut off."""
+        if not self._was_truncated(response, text):
+            return text
+        continuation_prompt = (
+            "Continue the answer from where it stopped. "
+            "Do not repeat the text already provided. "
+            "Finish the incomplete thought in 1-3 short sentences.\n\n"
+            f"Current partial answer:\n{text}"
+        )
+        try:
+            continuation = await self._call_llm(
+                contents + [{"role": "user", "parts": [{"text": continuation_prompt}]}],
+                config,
+            )
+            continuation_text = _response_text(continuation)
+            if continuation_text:
+                text = merge_continuation(text, continuation_text)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Brain continuation attempt failed: %s", exc)
+        return text
+
     # -- public API -----------------------------------------------------------
 
     async def converse(
@@ -357,6 +400,11 @@ class ConversationalBrain:
                     text = _response_text(response)
                     if not text:
                         logger.warning("Brain returned empty reply")
+                        return None
+                    text = await self._ensure_complete(response, contents, config, text)
+                    text = strip_meta_lead_in(text)
+                    if not text:
+                        logger.warning("Brain returned empty reply after safety checks")
                         return None
                     return ConversationResult(
                         reply=text,

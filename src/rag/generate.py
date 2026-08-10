@@ -4,6 +4,12 @@ import asyncio
 import random
 from typing import Any, Dict, List, Tuple
 
+from src.utils.response_safety import (
+    looks_truncated,
+    merge_continuation,
+    strip_meta_lead_in,
+)
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +28,11 @@ CRITICAL RULES:
 4. **Reformulate in your own words** - provide a natural conversational answer.
 5. **Combine information** from multiple sources into a coherent response.
 6. Reply like an Old Mutual insider: state facts confidently as product knowledge. NEVER
-   mention the Retrieved Data, a knowledge base, search results, sources, or documents in
-   your reply. If a detail is genuinely not covered, say so naturally, e.g. "That specific
-   detail isn't covered in our published guide - let me connect you with an agent who can
-   confirm it."
+   mention the Retrieved Data, a knowledge base, search results, sources, documents, or any
+   "available information" in your reply. Never open a reply by describing what information
+   is or isn't available. If a detail is genuinely not covered, say so naturally, e.g. "That
+   specific detail isn't covered in our published guide - let me connect you with an agent who
+   can confirm it."
 
 FORMAT:
 - Use bullet points for lists of features/benefits
@@ -205,7 +212,12 @@ class MiaGenerator:
             "Do NOT copy headings or Q&A format from sources - reformulate in your own words. "
             "Do not add facts not present in the sources."
             if num_sources > 0
-            else "No relevant documents found. Say you don't have enough information and ask if the user wants to talk to a human agent."
+            else (
+                "You have no reference material for this question. Do NOT mention documents, "
+                "searches, a knowledge base, or any available/retrieved information. Answer as "
+                "an Old Mutual specialist would: if the detail is genuinely not something we "
+                "publish, say so naturally and offer to connect the user with a human agent."
+            )
         )
 
         # Keep history compact and avoid duplicating the same context as both
@@ -279,7 +291,6 @@ class MiaGenerator:
                 except Exception:
                     # If we cannot read finish_reason, fall back to text heuristic.
                     hit_token_limit = self._looks_truncated(text)
-
                 if hit_token_limit:
                     try:
                         continuation_prompt = (
@@ -296,7 +307,7 @@ class MiaGenerator:
                         logger.warning("Continuation attempt failed: %s", continuation_error)
 
                 logger.info("Successfully generated response from Gemini API")
-                return text
+                return strip_meta_lead_in(text)
             except Exception as e:
                 if attempt >= max_attempts:
                     logger.error(f"GenAI error when generating response: {type(e).__name__}: {e}", exc_info=True)
@@ -315,58 +326,13 @@ class MiaGenerator:
 
     @staticmethod
     def _looks_truncated(text: str) -> bool:
-        s = (text or "").strip()
-        if not s:
-            return True
-
-        # Very short replies can naturally end without punctuation.
-        if len(s) < 80:
-            return False
-
-        if s.endswith((".", "!", "?", '"', "'", "*", ")", "]")):
-            return False
-
-        last_word = s.split()[-1].strip(".,!?;:'\")]").lower()
-        dangling_words = {
-            "a", "an", "and", "as", "at", "because", "but", "for",
-            "from", "in", "into", "of", "on", "or", "that", "the",
-            "to", "with", "which",
-        }
-        if last_word in dangling_words:
-            return True
-
-        # Unbalanced markdown bold is a strong signal of a cut-off answer.
-        if s.count("**") % 2 == 1:
-            return True
-
-        return False
+        """Deprecated alias kept for tests; use ``response_safety.looks_truncated``."""
+        return looks_truncated(text)
 
     @staticmethod
     def _merge_continuation(base_text: str, continuation_text: str) -> str:
-        base = (base_text or "").rstrip()
-        cont = (continuation_text or "").strip()
-        if not cont:
-            return base
-
-        if cont.lower() in base.lower():
-            return base
-
-        # Remove simple overlap when continuation starts by repeating the tail.
-        max_overlap = min(80, len(base), len(cont))
-        overlap = 0
-        for size in range(max_overlap, 11, -1):
-            if base[-size:].lower() == cont[:size].lower():
-                overlap = size
-                break
-
-        if overlap > 0:
-            cont = cont[overlap:].lstrip()
-
-        if not cont:
-            return base
-
-        separator = " " if base and base[-1].isalnum() and cont[0].isalnum() else ""
-        return f"{base}{separator}{cont}"
+        """Deprecated alias kept for tests; use ``response_safety.merge_continuation``."""
+        return merge_continuation(base_text, continuation_text)
 
 
 def generate_with_gemini(
