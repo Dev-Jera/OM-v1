@@ -1,7 +1,7 @@
 # Production-only deps for FastAPI (fits 4 GB build limit).
 # Use Gemini or OpenAI for embeddings; do not use sentence_transformers in prod.
 python-dotenv==1.0.0
-pydantic==2.5.0
+pydantic==2.13.4
 pyyaml==6.0.1
 fastapi==0.121.3
 uvicorn[standard]==0.27.0
