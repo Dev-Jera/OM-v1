@@ -16,8 +16,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Default text generation model for Google Gemini via google-genai.
-# As of the current SDK, gemini-2.5-flash is a fast, general-purpose model.
-MODEL_NAME = "gemini-2.5-flash"
+# Override at runtime with the MIA_MODEL env var.
+MODEL_NAME = os.getenv("MIA_MODEL", "gemini-3.6-flash")
 
 # Reserved last-resort replies. The "can't answer" message is only used when no
 # LLM is available at all (generation disabled/failed hard); normally the LLM

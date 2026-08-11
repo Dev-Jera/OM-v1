@@ -29,7 +29,7 @@ from src.utils.response_safety import looks_truncated, merge_continuation, strip
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.getenv("CONVERSATIONAL_BRAIN_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("CONVERSATIONAL_BRAIN_MODEL", "gemini-3.6-flash")
 
 PRODUCT_FLOWS = ("personal_accident", "travel_insurance", "motor_private", "serenicare")
 

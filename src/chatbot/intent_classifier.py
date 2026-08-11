@@ -7,7 +7,8 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # Use the same family as the main generator for consistency.
-INTENT_MODEL_NAME = "gemini-2.5-flash"
+# Override at runtime with the INTENT_MODEL env var.
+INTENT_MODEL_NAME = os.getenv("INTENT_MODEL", "gemini-3.6-flash")
 
 
 class SmallTalkResponder:

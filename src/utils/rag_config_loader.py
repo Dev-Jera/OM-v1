@@ -48,7 +48,7 @@ class RetrievalConfig(BaseModel):
 class GenerationConfig(BaseModel):
     enabled: bool = True
     backend: str = "gemini"
-    model: str = "gemini-1.5-flash"
+    model: str = "gemini-3.6-flash"
     api_key_env: str = "GEMINI_API_KEY"
 
 

@@ -41,5 +41,5 @@ generation:
   enabled: true
   backend: gemini
   # If you see "free_tier ... limit: 0", enable billing in Google AI Studio for this project
-  model: "gemini-2.5-flash"
+  model: "gemini-3.6-flash"
   api_key_env: GEMINI_API_KEY
