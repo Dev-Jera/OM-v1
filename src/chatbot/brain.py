@@ -173,6 +173,14 @@ def _response_text(response: Any) -> str:
     return (text or "").strip() if isinstance(text, str) else ""
 
 
+def _function_call_id(fc: Any) -> Optional[str]:
+    try:
+        call_id = getattr(fc, "id", None)
+        return str(call_id) if call_id else None
+    except Exception:
+        return None
+
+
 def _function_calls(response: Any) -> List[Dict[str, Any]]:
     """Extract (name, args) pairs from a Gemini response's function calls."""
     calls: List[Dict[str, Any]] = []
@@ -192,7 +200,7 @@ def _function_calls(response: Any) -> List[Dict[str, Any]]:
             name = str(getattr(fc, "name", "") or "")
             if not name:
                 continue
-            calls.append({"name": name, "args": _function_call_args(fc)})
+            calls.append({"name": name, "args": _function_call_args(fc), "id": _function_call_id(fc)})
     return calls
 
 
@@ -430,6 +438,7 @@ class ConversationalBrain:
                                     {
                                         "function_response": {
                                             "name": name,
+                                            "id": call.get("id"),
                                             "response": _hits_to_results(hits),
                                         }
                                     }
@@ -447,6 +456,7 @@ class ConversationalBrain:
                                     {
                                         "function_response": {
                                             "name": name,
+                                            "id": call.get("id"),
                                             "response": {"ok": True, "loaded": True},
                                         }
                                     }
@@ -461,6 +471,7 @@ class ConversationalBrain:
                                     {
                                         "function_response": {
                                             "name": name,
+                                            "id": call.get("id"),
                                             "response": {"error": "unknown tool"},
                                         }
                                     }
@@ -468,7 +479,7 @@ class ConversationalBrain:
                             }
                         )
 
-                contents = contents + [response_content(response)] + function_responses
+                contents = contents + [_model_content(response)] + function_responses
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("ConversationalBrain.converse failed: %s", exc, exc_info=True)
             return None
@@ -525,7 +536,11 @@ class ConversationalBrain:
             from google.genai import types
 
             if hasattr(types, "AutomaticFunctionCallingConfig"):
-                cfg["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
+                # maximum_remote_calls=0 prevents the SDK warning when AFC is
+                # disabled while its default remote-call limit is still set.
+                cfg["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+                    disable=True, maximum_remote_calls=0
+                )
         except Exception:  # pragma: no cover - depends on SDK version
             pass
         return cfg
@@ -539,24 +554,18 @@ class ConversationalBrain:
         }
 
 
-def response_content(response: Any) -> Dict[str, Any]:
-    """Extract the assistant content (with its function calls) for continuation."""
+def _model_content(response: Any) -> Any:
+    """Return the model's original content object for the next tool round.
+
+    Returning the SDK object (not a rebuilt dict) preserves fields the API
+    requires on continuation - notably the ``thought_signature`` that newer
+    Gemini models attach to function-call parts. Stripping it triggers a
+    400 INVALID_ARGUMENT on the next tool round.
+    """
     candidates = getattr(response, "candidates", None) or []
     if not candidates:
         raise RuntimeError("Brain response has no candidates")
     content = getattr(candidates[0], "content", None)
     if content is None:
         raise RuntimeError("Brain response candidate has no content")
-    parts = getattr(content, "parts", None) or []
-    role = "model" if getattr(content, "role", None) in (None, "model") else str(content.role)
-    return {"role": role, "parts": [{"text": str(p.text)} if getattr(p, "text", None) else {"function_call": _part_function_call(p)} for p in parts]}
-
-
-def _part_function_call(part: Any) -> Dict[str, Any]:
-    fc = getattr(part, "function_call", None)
-    if fc is None:
-        return {}
-    return {
-        "name": getattr(fc, "name", None),
-        "args": _function_call_args(fc),
-    }
+    return content

@@ -2949,6 +2949,21 @@ async def startup_event():
         app.state.heartbeat_task = None
         logger.info("Service heartbeat emitter disabled")
 
+    # Build the BM25 keyword index if the processed chunks are present so hybrid
+    # retrieval works even on hosts that start uvicorn directly (no startup script).
+    try:
+        chunks_path = Path(__file__).parent.parent.parent / "data" / "processed" / "website_chunks.jsonl"
+        if chunks_path.exists():
+            from src.rag.keyword_search import BM25KeywordSearch
+
+            bm25 = BM25KeywordSearch()
+            indexed = bm25.build_index(chunks_path)
+            logger.info("BM25 index ready at startup: %s chunks -> %s", indexed, bm25.index_path)
+        else:
+            logger.warning("website_chunks.jsonl not found at %s; BM25 startup build skipped", chunks_path)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("BM25 startup build failed (non-fatal): %s", e)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():

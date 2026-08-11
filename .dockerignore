@@ -12,7 +12,11 @@ htmlcov
 logs
 notebooks
 docs
-data
+data/*
+!data/processed
+data/processed/*
+!data/processed/website_documents.jsonl
+!data/processed/website_chunks.jsonl
 
 .coverage
 .env
