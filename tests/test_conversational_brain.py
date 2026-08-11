@@ -214,6 +214,27 @@ async def test_disabled_brain_returns_none():
     assert await brain.confirm_quote_offer("yes") == "other"
 
 
+def test_quote_tool_enum_has_no_empty_string():
+    """Gemini rejects function-declaration enums containing an empty string
+    (400 INVALID_ARGUMENT ... enum[0]: cannot be empty). The 'unknown'
+    sentinel must stand in for the previous empty-string value."""
+    retriever = RecordingRetriever()
+    brain = make_brain(ScriptedLLM([]), retriever)
+
+    config = brain._conversation_config(pending_quote_offer=False)
+    tools = config["tools"]
+    declarations = [
+        d
+        for tool in tools
+        for d in tool.get("function_declarations", [])
+        if d["name"] == "request_guided_quote"
+    ]
+    assert len(declarations) == 1
+    enum = declarations[0]["parameters"]["properties"]["product"]["enum"]
+    assert enum == ["unknown"] + ["personal_accident", "travel_insurance", "motor_private", "serenicare"]
+    assert "" not in enum
+
+
 @pytest.mark.asyncio
 async def test_empty_reply_returns_none():
     retriever = RecordingRetriever()

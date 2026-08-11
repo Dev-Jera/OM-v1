@@ -47,7 +47,12 @@ from src.chatbot.flows.registry import get_flow_steps
 from src.chatbot.state_manager import StateManager
 from src.chatbot.validation import FormValidationError
 from src.chatbot.brain import ConversationalBrain
-from src.rag.generate import MiaGenerator
+from src.rag.generate import (
+    CANNOT_ANSWER_MESSAGE,
+    ERROR_RETRY_MESSAGE,
+    MiaGenerator,
+    is_system_error_answer,
+)
 from src.rag.query import retrieve_context
 from src.utils.product_matcher import ProductMatcher
 from src.utils.rag_config_loader import load_rag_config
@@ -291,7 +296,15 @@ class APIRAGAdapter:
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning("Chunk-id extractive fallback failed: %s", e)
 
-            answer_text = "\n\n".join(snippets).strip() or "I'm not sure based on the available information."
+            answer_text = "\n\n".join(snippets).strip()
+            if not answer_text:
+                answer_text = CANNOT_ANSWER_MESSAGE
+                return {
+                    "answer": answer_text,
+                    "confidence": confidence,
+                    "sources": context_docs,
+                    "offer_human": True,
+                }
             return {"answer": answer_text, "confidence": confidence, "sources": context_docs}
 
         # If generation is globally disabled, always fall back to extractive mode.
@@ -299,7 +312,9 @@ class APIRAGAdapter:
             return _extractive_answer()
 
         stats = _retrieval_stats()
-        if not context_docs or stats["avg_score"] < 0.55:
+        if context_docs and stats["avg_score"] < 0.55:
+            # Low-relevance chunks: build an extractive answer from them rather
+            # than letting the LLM stretch weak evidence into an answer.
             return _extractive_answer()
 
         if self.cfg.generation.backend == "gemini":
@@ -308,11 +323,21 @@ class APIRAGAdapter:
                 answer = await mia.generate(query, context_docs, conversation_history)
             except Exception as e:  # pragma: no cover
                 logger.error("MiaGenerator.generate raised unexpectedly: %s", e, exc_info=True)
-                return _extractive_answer()
+                return {
+                    "answer": ERROR_RETRY_MESSAGE,
+                    "confidence": 0.0,
+                    "sources": context_docs,
+                    "error": True,
+                }
 
-            fallback_phrase = "I'm having trouble retrieving those details. Please call 0800-100-900 for immediate help."
-            if not answer or fallback_phrase in answer:
-                return _extractive_answer()
+            # System error: the generator itself failed or returned nothing.
+            if not answer or is_system_error_answer(answer):
+                return {
+                    "answer": answer or ERROR_RETRY_MESSAGE,
+                    "confidence": 0.0,
+                    "sources": context_docs,
+                    "error": True,
+                }
 
             return {"answer": answer, "confidence": _compute_confidence(), "sources": context_docs}
 

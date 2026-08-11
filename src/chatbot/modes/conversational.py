@@ -372,6 +372,12 @@ def _is_fallback_like_answer(answer: str) -> bool:
         "i'm not sure based on the available information",
         "please try again in a moment",
         "please rephrase",
+        "can't answer that",
+        "cannot answer that",
+        "i can't answer that",
+        "connect you with an agent",
+        "connect you to an agent",
+        "not covered in our published guide",
     ]
     return any(marker in lowered for marker in fallback_markers)
 
@@ -964,15 +970,34 @@ class ConversationalMode:
         # --- Escalation/handover logic ---
         session = self.state_manager.get_session(session_id) or {}
 
+        # A real system error (generator/LLM failure) is not an "agent needed"
+        # case: the user just gets the retry message, with no handoff offer.
+        system_error = bool(response.get("error"))
+
         # If confidence is very low, suggest handover button.
         show_handover_button = False
-        if confidence < 0.2:
+        if confidence < 0.2 and not system_error:
+            show_handover_button = True
+
+        # No relevant chunks -> the LLM (or the last-resort extractive reply)
+        # already phrased the can't-answer + agent offer. Arm the existing
+        # pending_agent_offer handoff so a "yes" escalates to a human agent.
+        offer_agent = not system_error and (
+            bool(response.get("offer_human")) or (
+                not retrieval_results and confidence < 0.35
+            )
+        )
+        if offer_agent:
+            sess = self.state_manager.get_session(session_id) or {}
+            ctx = dict(sess.get("context") or {})
+            ctx["pending_agent_offer"] = True
+            self.state_manager.update_session(session_id, {"context": ctx})
             show_handover_button = True
 
         products_matched_names = [p[2]["name"] for p in products] if products else []
         if not products_matched_names and topic.get("name") and should_reuse_topic:
             products_matched_names = [topic["name"]]
-        if self.response_processor:
+        if self.response_processor and not system_error and not offer_agent:
             processed = self.response_processor.process_response(
                 raw_response=response.get("answer"),
                 user_input=message,
@@ -1272,6 +1297,16 @@ class ConversationalMode:
             ctx["pending_quote_offer"] = True
             self.state_manager.update_session(session_id, {"context": ctx})
 
+        # If the brain phrased a can't-answer reply, arm the agent handoff so a
+        # "yes" escalates to a human. The reply text itself stays LLM-generated.
+        show_handover_button = result.confidence < 0.2
+        if not result.quote_requested and _is_fallback_like_answer(result.reply):
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            ctx["pending_agent_offer"] = True
+            self.state_manager.update_session(session_id, {"context": ctx})
+            show_handover_button = True
+
         payload = {
             "mode": "conversational",
             "response": result.reply,
@@ -1281,7 +1316,7 @@ class ConversationalMode:
             "intent_type": "INFORMATIONAL",
             "suggested_action": suggested_action,
             "confidence": result.confidence,
-            "show_handover_button": result.confidence < 0.2,
+            "show_handover_button": show_handover_button,
             "brain": True,
         }
 

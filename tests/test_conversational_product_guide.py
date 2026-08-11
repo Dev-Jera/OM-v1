@@ -590,3 +590,77 @@ async def test_car_insurance_uses_digital_flow_fallback_filter_when_matcher_miss
     assert out["mode"] == "conversational"
     call = rag.retrieve_calls[-1]
     assert call["filters"] == {"products": ["website:product:other/general/motor-insurance"]}
+
+
+class NoHitsRAG:
+    """RAG that finds no chunks and returns a can't-answer reply."""
+
+    def __init__(self):
+        self.retrieve_calls = []
+
+    async def retrieve(self, query: str, filters=None, top_k=None):
+        self.retrieve_calls.append({"query": query, "filters": filters, "top_k": top_k})
+        return []
+
+    async def generate(self, query: str, context_docs, conversation_history):
+        return {
+            "answer": (
+                "I'm sorry, I can't answer that. Would you like me to connect you "
+                "with an agent who can give you more information?"
+            ),
+            "confidence": 0.05,
+            "sources": [],
+        }
+
+
+@pytest.mark.asyncio
+async def test_no_chunks_arms_agent_offer_and_keeps_llm_reply():
+    db = PostgresDB()
+    redis = RedisCache()
+    sm = StateManager(redis, db)
+    session_id = sm.create_session("1")
+    rag = NoHitsRAG()
+    conv = ConversationalMode(rag, NoMatchMatcher(), sm)
+
+    out = await conv.process("what is the minimum deposit for the balanced fund", session_id, "1")
+
+    assert out["mode"] == "conversational"
+    # The LLM's own can't-answer text is shown untouched (not swapped for a
+    # clarifying question and not replaced by a static retry message).
+    assert out["response"] == (
+        "I'm sorry, I can't answer that. Would you like me to connect you "
+        "with an agent who can give you more information?"
+    )
+    assert out.get("show_handover_button") is True
+    assert rag.retrieve_calls, "retrieval should still run for no-chunk questions"
+    session = sm.get_session(session_id)
+    assert session["context"].get("pending_agent_offer") is True
+
+
+@pytest.mark.asyncio
+async def test_system_error_returns_retry_and_no_agent_offer():
+    class ErrorRAG:
+        async def retrieve(self, query: str, filters=None, top_k=None):
+            return []
+
+        async def generate(self, query: str, context_docs, conversation_history):
+            return {
+                "answer": "I'm having trouble retrieving those details right now. Please try again in a moment.",
+                "confidence": 0.0,
+                "sources": [],
+                "error": True,
+            }
+
+    db = PostgresDB()
+    redis = RedisCache()
+    sm = StateManager(redis, db)
+    session_id = sm.create_session("1")
+    conv = ConversationalMode(ErrorRAG(), NoMatchMatcher(), sm)
+
+    out = await conv.process("what is the minimum deposit for the balanced fund", session_id, "1")
+
+    assert out["mode"] == "conversational"
+    assert out["response"] == "I'm having trouble retrieving those details right now. Please try again in a moment."
+    assert out.get("show_handover_button") is False
+    session = sm.get_session(session_id)
+    assert not session["context"].get("pending_agent_offer")

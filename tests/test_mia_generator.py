@@ -72,6 +72,52 @@ async def test_mia_generator_empty_text_returns_user_safe_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mia_generator_no_hits_still_calls_llm(monkeypatch):
+    """No-chunk questions must go to the LLM, not a canned static drop-in."""
+
+    class _NoHitsModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            return _FakeResponse(
+                "I'm sorry, I don't have that detail handy. Would you like me to "
+                "connect you with an agent who can confirm it?"
+            )
+
+    models = _NoHitsModels()
+    gen = MiaGenerator.__new__(MiaGenerator)
+    gen.client = _FakeClient(models)
+    gen.temperature = 0.2
+    gen.max_context_chars = 12000
+    gen.min_score = 0.55
+    gen.max_sources = 5
+
+    monkeypatch.setattr(gen, "_build_context", lambda hits: ("", 0, 0.0))
+    monkeypatch.setattr(gen, "_build_history_summary", lambda history: "")
+
+    out = await gen.generate("what is the minimum deposit", hits=[], conversation_history=[])
+
+    assert models.calls == 1, "LLM must still be called when there are no chunks"
+    assert out == (
+        "I'm sorry, I don't have that detail handy. Would you like me to "
+        "connect you with an agent who can confirm it?"
+    )
+    assert "please try again in a moment" not in out.lower()
+
+
+def test_is_system_error_answer():
+    from src.rag.generate import is_system_error_answer
+
+    assert is_system_error_answer(
+        "I'm having trouble retrieving those details right now. Please try again in a moment."
+    ) is True
+    assert is_system_error_answer("I'm sorry, I can't answer that.") is False
+    assert is_system_error_answer("") is False
+
+
+@pytest.mark.asyncio
 async def test_mia_generator_recovers_truncated_output_with_continuation(monkeypatch):
     class _FakeCandidate:
         """Simulates a Gemini candidate whose finish_reason == MAX_TOKENS (value 2)."""

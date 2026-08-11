@@ -166,3 +166,27 @@ async def test_pending_quote_offer_other_continues_to_brain():
 
     assert out["response"] == "brain handled it"
     assert len(brain.converse_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_can_not_answer_brain_reply_arms_agent_offer():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    brain = DummyBrain(
+        result=SimpleResult(
+            reply=(
+                "I'm sorry, I can't answer that. Would you like me to connect you "
+                "with an agent who can give you more information?"
+            )
+        )
+    )
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain)
+
+    out = await conv.process("what is the minimum deposit for the balanced fund", session_id, "1")
+
+    # The brain's own wording is preserved; the agent handoff is armed behind it.
+    assert out["response"].startswith("I'm sorry, I can't answer that.")
+    assert out.get("show_handover_button") is True
+    session = sm.get_session(session_id)
+    assert session["context"].get("pending_agent_offer") is True

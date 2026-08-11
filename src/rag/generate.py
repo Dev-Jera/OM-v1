@@ -19,6 +19,27 @@ logger = logging.getLogger(__name__)
 # As of the current SDK, gemini-2.5-flash is a fast, general-purpose model.
 MODEL_NAME = "gemini-2.5-flash"
 
+# Reserved last-resort replies. The "can't answer" message is only used when no
+# LLM is available at all (generation disabled/failed hard); normally the LLM
+# phrases the can't-answer + agent offer itself. The error message is reserved
+# for genuine system errors (LLM API failures / empty output), never for the
+# "no relevant chunks" case.
+CANNOT_ANSWER_MESSAGE = (
+    "I'm sorry, I can't answer that. Would you like me to connect you with an "
+    "agent who can give you more information?"
+)
+
+ERROR_RETRY_MESSAGE = (
+    "I'm having trouble retrieving those details right now. Please try again in a moment."
+)
+
+
+def is_system_error_answer(text: str) -> bool:
+    """True when the reply is the reserved 'system error' retry message."""
+    lowered = (text or "").strip().lower()
+    return bool(lowered) and "please try again in a moment" in lowered
+
+
 SYSTEM_INSTRUCTION = """
 You are MIA, the Senior Virtual Assistant for Old Mutual Uganda.
 CRITICAL RULES:
@@ -272,7 +293,7 @@ class MiaGenerator:
                 text = (getattr(response, "text", "") or "").strip()
                 if not text:
                     logger.warning("GenAI returned empty text response.")
-                    return "I'm having trouble retrieving those details right now. Please try again in a moment."
+                    return ERROR_RETRY_MESSAGE
 
                 # Request a continuation only when Gemini itself reports the output
                 # was cut off at the token budget (finish_reason == MAX_TOKENS = 2).
@@ -322,7 +343,7 @@ class MiaGenerator:
                 )
                 await asyncio.sleep(backoff)
 
-        return "I'm having trouble retrieving those details right now. Please try again in a moment."
+        return ERROR_RETRY_MESSAGE
 
     @staticmethod
     def _looks_truncated(text: str) -> bool:

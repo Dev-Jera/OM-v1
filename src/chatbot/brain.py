@@ -127,16 +127,16 @@ _TOOLS: List[Dict[str, Any]] = [
                 "name": "request_guided_quote",
                 "description": (
                     "Call this when the user wants a quotation, to apply, or to buy an Old "
-                    "Mutual product. Choose the detected product key, or empty string if "
-                    "the product is unknown."
+                    "Mutual product. Choose the detected product key, or 'unknown' if "
+                    "the product cannot be detected."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "product": {
                             "type": "string",
-                            "enum": [""] + list(PRODUCT_FLOWS),
-                            "description": "The detected product key, or empty string if unknown.",
+                            "enum": ["unknown"] + list(PRODUCT_FLOWS),
+                            "description": "The detected product key, or 'unknown' if it cannot be detected.",
                         }
                     },
                     "required": ["product"],
