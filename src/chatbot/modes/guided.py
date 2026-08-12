@@ -121,4 +121,7 @@ class GuidedMode:
             payload["travel_flow_version"] = self.TRAVEL_INSURANCE_FLOW_VERSION
         result = await flow.start(user_id, payload)
 
-        return {"mode": "guided", "flow": flow_name, "step": 0, "response": result.get("response"), "data": result.get("data")}
+        if result.get("collected_data"):
+            self.state_manager.update_session(session_id, {"collected_data": result["collected_data"]})
+
+        return {"mode": "guided", "flow": flow_name, "step": result.get("next_step", 0), "response": result.get("response"), "data": result.get("data")}
