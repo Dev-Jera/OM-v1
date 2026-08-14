@@ -371,9 +371,6 @@ def get_router():
     return chat_router
 
 
-GENERAL_INFO_ALIASES: Dict[str, str] = {}
-
-
 def _normalize_general_info_key(value: str) -> str:
     key = (value or "").strip().lower()
     if not key:
@@ -427,14 +424,7 @@ def _general_info_candidate_paths(product: str, product_dir: Path) -> List[Path]
 
     results = []
 
-    # 1) alias match first
-    alias_target = GENERAL_INFO_ALIASES.get(normalized)
-    if alias_target:
-        alias_path = product_dir / f"{alias_target}.json"
-        if alias_path.exists():
-            results.append(alias_path)
-
-    # 2) exact filename/display-name matches
+    # 1) exact filename/display-name matches
     for path in candidate_files:
         if normalized in {
             _normalize_general_info_key(path.stem),
@@ -443,7 +433,7 @@ def _general_info_candidate_paths(product: str, product_dir: Path) -> List[Path]
             if path not in results:
                 results.append(path)
 
-    # 3) title/product_id matches from JSON content
+    # 2) title/product_id matches from JSON content
     for path in candidate_files:
         info = _load_info(path)
         if normalized in {
@@ -453,7 +443,7 @@ def _general_info_candidate_paths(product: str, product_dir: Path) -> List[Path]
             if path not in results:
                 results.append(path)
 
-    # 4) token overlap scoring
+    # 3) token overlap scoring
     input_tokens = _general_info_tokens(normalized)
     scored_paths: List[tuple[Path, tuple[int, float]]] = []
     if input_tokens:
@@ -483,7 +473,7 @@ def _general_info_candidate_paths(product: str, product_dir: Path) -> List[Path]
         if path not in results:
             results.append(path)
 
-    # 5) fuzzy match last
+    # 4) fuzzy match last
     lookup: Dict[str, Path] = {}
     for path in candidate_files:
         if path in results:
@@ -534,14 +524,7 @@ def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path
         metadata_cache[path] = data
         return data
 
-    # 1) alias match first
-    alias_target = GENERAL_INFO_ALIASES.get(normalized)
-    if alias_target:
-        alias_path = product_dir / f"{alias_target}.json"
-        if alias_path.exists():
-            return alias_path
-
-    # 2) exact filename/display-name matches
+    # 1) exact filename/display-name matches
     for path in candidate_files:
         if normalized in {
             _normalize_general_info_key(path.stem),
@@ -549,7 +532,7 @@ def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path
         }:
             return path
 
-    # 3) title/product_id matches from JSON content
+    # 2) title/product_id matches from JSON content
     for path in candidate_files:
         info = _load_info(path)
         if normalized in {
@@ -558,7 +541,7 @@ def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path
         }:
             return path
 
-    # 4) token overlap scoring
+    # 3) token overlap scoring
     input_tokens = _general_info_tokens(normalized)
     best_path: Optional[Path] = None
     best_score: tuple[int, float] = (0, 0.0)
@@ -586,7 +569,7 @@ def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path
         if best_path is not None and best_score[0] >= min_overlap and best_score[1] >= 0.5:
             return best_path
 
-    # 5) fuzzy match last
+    # 4) fuzzy match last
     lookup: Dict[str, Path] = {}
     for path in candidate_files:
         info = _load_info(path)

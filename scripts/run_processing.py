@@ -82,6 +82,30 @@ def find_latest_website_scrape(raw_dir: Path) -> Path:
     )
 
 
+def load_added_chunk_lines(chunks_file: Path) -> list[str]:
+    """Return JSONL lines for chunks that are NOT from the website scrape.
+
+    These are your added PDF / text chunks (doc_id does not start with "website:").
+    Re-scraping replaces only website chunks; added chunks are preserved across re-scrapes.
+    """
+    if not chunks_file.exists():
+        return []
+    kept: list[str] = []
+    with open(chunks_file, "r", encoding="utf-8") as f:
+        for line in f:
+            payload = line.strip()
+            if not payload:
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            doc_id = str(obj.get("doc_id") or "")
+            if doc_id and not doc_id.startswith("website:"):
+                kept.append(payload)
+    return kept
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Process raw scrape JSON into chunked JSONL for RAG")
     parser.add_argument(
@@ -131,7 +155,26 @@ def main() -> int:
         logger.info("Processing input: %s", input_path)
         logger.info("Output dir: %s", args.output_dir)
 
+        chunks_path = args.output_dir / "website_chunks.jsonl"
+        preserved = load_added_chunk_lines(chunks_path)
+
         stats = processor.process(input_path, output_dir=args.output_dir)
+
+        if preserved:
+            fresh_lines: list[str] = []
+            if chunks_path.exists():
+                with open(chunks_path, "r", encoding="utf-8") as f:
+                    fresh_lines = [line.rstrip("\n") for line in f if line.strip()]
+            with open(chunks_path, "w", encoding="utf-8") as f:
+                for line in preserved:
+                    f.write(line + "\n")
+                for line in fresh_lines:
+                    f.write(line + "\n")
+            logger.info(
+                "Preserved %s added chunk(s) (PDF/text) across re-scrape; merged with %s new website chunk(s)",
+                len(preserved),
+                len(fresh_lines),
+            )
 
         logger.info("DONE")
         logger.info("Documents written: %s", stats.documents_written)

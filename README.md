@@ -54,6 +54,26 @@ python scripts/generate_embeddings.py \
 python scripts/run_rag.py
 ```
 
+### Add your own knowledge (no scraping needed)
+
+Drop PDFs and/or plain-text (`.txt`/`.md`) files into the knowledge folder and ingest them directly
+into the vector store (Qdrant Cloud by default) so the bot can answer from them:
+
+```bash
+# 1. Put files in data/raw/knowledge/ (PDFs, .txt, or .md)
+mkdir -p data/raw/knowledge
+
+# 2. Ingest everything in the folder
+python scripts/add_knowledge_folder.py
+```
+
+The script chunks the files (same settings as the PDF pipeline), appends them to the KB, embeds them,
+pushes them into the configured vector store, and rebuilds the keyword index. Re-running is safe —
+duplicate chunk IDs are skipped. Uses `QDRANT_URL` / `QDRANT_API_KEY` / `QDRANT_COLLECTION` /
+`GEMINI_API_KEY` from `.env`.
+
+Optional flags: `--skip-append`, `--skip-vector-upsert`, `--skip-bm25`, `--verbose`.
+
 ## 📚 Documentation
 - [Contributing](CONTRIBUTING.md)
 - [Exploring scraping](SCRAPER_USAGE.md)

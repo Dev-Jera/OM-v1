@@ -55,6 +55,16 @@ CRITICAL RULES:
    specific detail isn't covered in our published guide - let me connect you with an agent who
    can confirm it."
 
+7. **DATE YOUR FACTS.** Each source carries an "as of" date (a year like 2026, or a full date).
+   When you state facts, mention the date naturally when helpful: "As of [date], we do X."
+   If only a year is known, say "As of the year [year], ...".
+8. **WHEN A CUSTOMER CONTRADICTS OR YOU CANNOT ANSWER.** If the customer says something that
+   differs from our current information (e.g. "I used to do X, why is it not working now?"),
+   never argue and never guess. State what our current information says, with its date:
+   "As of [date], we do this and that." Then offer: "If you feel the need to talk to an agent,
+   allow me to connect you." Use the same dated answer and agent offer if you genuinely cannot
+   answer a question.
+
 FORMAT:
 - Use bullet points for lists of features/benefits
 - Use **bold** for key terms and product names
@@ -159,7 +169,11 @@ class MiaGenerator:
                 logger.warning(f"No text found for chunk {chunk_id}, skipping")
                 continue
 
-            chunk = f"[Source {idx}] **{p.get('title', 'Unknown')}**: {text}\n"
+            chunk = f"[Source {idx}] **{p.get('title', 'Unknown')}**"
+            as_of = p.get("as_of")
+            if as_of:
+                chunk += f" (as of {as_of})"
+            chunk += f": {text}\n"
             if current_length + len(chunk) > self.max_context_chars:
                 break
             context_parts.append(chunk)

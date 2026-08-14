@@ -108,3 +108,32 @@ class QdrantVectorStore:
                 }
             )
         return out
+
+    def delete_stale_points(self, valid_chunk_ids) -> int:
+        """
+        Delete points whose payload chunk id is not in ``valid_chunk_ids``.
+
+        Used to sync Qdrant to the current chunks JSONL after a re-scrape, so
+        stale site chunks are removed while added (PDF/text) chunks are kept.
+        Returns the number of points deleted.
+        """
+        valid = {str(i) for i in valid_chunk_ids}
+        stale: List[str] = []
+        next_offset: Any = None
+
+        while True:
+            kwargs: dict[str, Any] = {"limit": 100, "with_payload": True, "with_vectors": False}
+            if next_offset is not None:
+                kwargs["offset"] = next_offset
+            points, next_offset = self.client.scroll(collection_name=self.collection, **kwargs)
+            for p in points:
+                payload = p.payload or {}
+                chunk_id = payload.get("id") or payload.get("chunk_id")
+                if chunk_id is not None and str(chunk_id) not in valid:
+                    stale.append(str(p.id))
+            if not points or next_offset is None:
+                break
+
+        if stale:
+            self.client.delete(collection_name=self.collection, points_selector=stale)
+        return len(stale)

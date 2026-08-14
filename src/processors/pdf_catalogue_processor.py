@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -77,6 +78,34 @@ def _split_chars(text: str, max_chars: int, overlap_chars: int) -> list[str]:
     return out
 
 
+def _date_from_filename(stem: str) -> str | None:
+    """Extract a leading date (YYYY, YYYY-MM, or YYYY-MM-DD) from a filename stem."""
+    match = re.match(r"^\s*(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?", stem)
+    if not match:
+        return None
+    year = match.group(1)
+    month = match.group(2)
+    day = match.group(3)
+    if month and day:
+        return f"{year}-{month}-{day}"
+    if month:
+        return f"{year}-{month}"
+    return year
+
+
+def _resolve_as_of(filename_stem: str, explicit: str | None = None) -> str:
+    """Determine the 'as of' date for a chunk.
+
+    Priority: explicit value, then a date embedded in the filename, then the current year.
+    """
+    if explicit:
+        return explicit
+    from_filename = _date_from_filename(filename_stem)
+    if from_filename:
+        return from_filename
+    return str(date.today().year)
+
+
 @dataclass(frozen=True)
 class PDFProcessedStats:
     documents_written: int
@@ -109,6 +138,7 @@ class PDFCatalogueProcessor:
         doc_id: str | None = None,
         title: str | None = None,
         source_url: str | None = None,
+        as_of: str | None = None,
     ) -> PDFProcessedStats:
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -119,6 +149,7 @@ class PDFCatalogueProcessor:
 
         resolved_title = title or pdf_path.stem
         resolved_doc_id = doc_id or f"pdf:product_catalogue:{_slugify(pdf_path.stem)}"
+        resolved_as_of = _resolve_as_of(pdf_path.stem, explicit=as_of)
 
         output_dir.mkdir(parents=True, exist_ok=True)
         docs_path = output_dir / documents_filename
@@ -132,6 +163,7 @@ class PDFCatalogueProcessor:
             "category": "catalogue",
             "subcategory": "product_catalogue",
             "source_file": str(pdf_path),
+            "as_of": resolved_as_of,
             "page_count": len(page_texts),
             "sections": [{"heading": f"Page {page_num}", "content": text} for page_num, text in page_texts],
             "faqs": [],
@@ -181,6 +213,7 @@ class PDFCatalogueProcessor:
             "category": document["category"],
             "subcategory": document["subcategory"],
             "source_file": document["source_file"],
+            "as_of": document["as_of"],
         }
 
         for page_number, page_text in page_texts:

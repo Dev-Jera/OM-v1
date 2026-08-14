@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 
 from src.utils.rag_config_loader import load_rag_config
-from src.rag.ingest import ingest_chunks_to_qdrant
+from src.rag.ingest import _vector_store_from_config, ingest_chunks_to_qdrant
 from src.rag.keyword_search import BM25KeywordSearch
 
 
@@ -41,6 +41,29 @@ def main() -> int:
     cfg = load_rag_config(args.config)
     total = ingest_chunks_to_qdrant(args.chunks_file, cfg, limit=args.limit)
     logger.info("Embedded and stored %s chunks into %s collection '%s'", total, cfg.vector_store.provider, cfg.vector_store.collection)
+
+    provider = (cfg.vector_store.provider or "").lower()
+    if provider in ("qdrant_http", "qdrant_local") and args.limit is None:
+        # Sync Qdrant to the chunks file: remove points that are no longer in the
+        # file (stale website chunks from a previous scrape). Added PDF/text chunks
+        # are still in the file, so they are kept.
+        valid_ids: set[str] = set()
+        with open(args.chunks_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk_id = obj.get("id")
+                if chunk_id:
+                    valid_ids.add(str(chunk_id))
+        store = _vector_store_from_config(cfg)
+        removed = store.delete_stale_points(valid_ids)
+        logger.info("Vector store synced to %s: removed %s stale chunk(s) no longer in %s", provider, removed, args.chunks_file)
+    elif provider not in ("qdrant_http", "qdrant_local"):
+        logger.info("Vector provider '%s' does not support sync cleanup; skipping stale-point removal", provider)
 
     # Also build BM25 keyword search index if hybrid search is enabled
     if cfg.retrieval.hybrid.enabled:

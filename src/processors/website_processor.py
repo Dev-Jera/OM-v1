@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -28,6 +30,23 @@ def _safe_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _resolve_scrape_date(scraped_at: str) -> str:
+    """Determine the 'as of' date for a scraped chunk.
+
+    Prefers the scrape date (YYYY-MM-DD, or at least a 4-digit year); falls back to
+    the current year so the bot can still say "As of the year YYYY, ...".
+    """
+    value = (scraped_at or "").strip()
+    if value:
+        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", value)
+        if match:
+            return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+        match = re.search(r"(?<![\d-])(\d{4})(?![\d])", value)
+        if match:
+            return match.group(1)
+    return str(date.today().year)
 
 
 def _split_words(text: str, chunk_size_words: int, overlap_words: int) -> list[str]:
@@ -326,6 +345,7 @@ class WebsiteProcessor:
             "article_id": _safe_text(item.get("article_id")),
             "page_id": _safe_text(item.get("page_id")),
             "scraped_at": _safe_text(item.get("scraped_at")),
+            "as_of": _resolve_scrape_date(_safe_text(item.get("scraped_at"))),
             "sections": cleaned_sections,
             "faqs": cleaned_faqs,
         }
@@ -357,6 +377,7 @@ class WebsiteProcessor:
             "article_id": doc.get("article_id"),
             "page_id": doc.get("page_id"),
             "scraped_at": doc.get("scraped_at"),
+            "as_of": doc.get("as_of"),
         }
 
         sections: list[dict[str, str]] = doc.get("sections") or []
