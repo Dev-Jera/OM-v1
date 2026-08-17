@@ -5,6 +5,7 @@ Synonym and keyword expansion for query enhancement.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -58,6 +59,7 @@ class SynonymExpander:
             Expanded query with synonyms added
         """
         query_lower = query.lower()
+        query_tokens = {t.lower() for t in re.findall(r"\b\w+\b", query)}
         # Keep original word order; append new terms (no alphabetical sort)
         seen: Set[str] = set()
         out: List[str] = []
@@ -81,7 +83,9 @@ class SynonymExpander:
                         out.append(t)
 
         for abbrev, full_term in self.abbreviations.items():
-            if abbrev.lower() in query_lower and full_term.lower() not in seen:
+            # Match abbreviations only as standalone words, never inside other words
+            # (e.g. "mi" inside "premium" must not expand to "motor insurance").
+            if abbrev.lower() in query_tokens and full_term.lower() not in seen:
                 seen.add(full_term.lower())
                 out.append(full_term)
 

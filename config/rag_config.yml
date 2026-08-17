@@ -32,10 +32,12 @@ vector_store:
 
 retrieval:
   top_k: 5   # fetch more chunks so product-specific queries (e.g. Somesa Plan) get relevant context
+  fetch_k: 25  # candidate pool before final rerank (was 10)
   hybrid:
     enabled: true
     dense_weight: 0.7
     sparse_weight: 0.3
+    rrf_k: 60  # position-fusion constant
 
 generation:
   enabled: true

@@ -40,12 +40,34 @@ class DummyBrain:
 
 
 class SimpleResult:
-    def __init__(self, reply="brain reply", confidence=0.8, sources=None, quote_requested=False, product=None):
+    def __init__(
+        self,
+        reply="brain reply",
+        confidence=0.8,
+        sources=None,
+        quote_requested=False,
+        product=None,
+        used_knowledge=False,
+    ):
         self.reply = reply
         self.confidence = confidence
         self.sources = sources or []
         self.quote_requested = quote_requested
         self.product = product
+        self.used_knowledge = used_knowledge
+
+
+class DummyRouter:
+    """Fake intent router returning a scripted label/reply."""
+
+    def __init__(self, label="OM_QUESTION", reply=None):
+        self.label = label
+        self.reply = reply
+        self.calls = []
+
+    async def route(self, message):
+        self.calls.append(message)
+        return self.label, self.reply
 
 
 def make_session(sm, user_id="1"):
@@ -190,3 +212,102 @@ async def test_can_not_answer_brain_reply_arms_agent_offer():
     assert out.get("show_handover_button") is True
     session = sm.get_session(session_id)
     assert session["context"].get("pending_agent_offer") is True
+
+
+@pytest.mark.asyncio
+async def test_router_greeting_answers_directly_no_brain_no_rag():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    router = DummyRouter(label="GREETING", reply="Hey there! How can I help you with Old Mutual today?")
+    brain = DummyBrain(result=SimpleResult(reply="should not be used"))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("howzit", session_id, "1")
+
+    assert out["response"] == "Hey there! How can I help you with Old Mutual today?"
+    assert out["intent_type"] == "NO_RETRIEVAL"
+    assert len(router.calls) == 1
+    assert len(brain.converse_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_fast_path_greeting_uses_canned():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    router = DummyRouter(label="GREETING", reply=None)
+    brain = DummyBrain(result=SimpleResult(reply="should not be used"))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("yo", session_id, "1")
+
+    assert "MIA" in out["response"]
+    assert len(brain.converse_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_off_topic_reply():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    router = DummyRouter(label="OFF_TOPIC", reply="I only help with Old Mutual products and services.")
+    brain = DummyBrain(result=SimpleResult(reply="should not be used"))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("what is the weather", session_id, "1")
+
+    assert out["response"] == "I only help with Old Mutual products and services."
+    assert len(brain.converse_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_om_question_with_ungrounded_brain_forces_chunks():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    router = DummyRouter(label="OM_QUESTION", reply=None)
+    brain = DummyBrain(result=SimpleResult(reply="I remember serenicare covers dental.", used_knowledge=False))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("what does serenicare cover", session_id, "1")
+
+    # The brain skipped the knowledge base, so the reply is regenerated strictly
+    # from retrieved chunks (the DummyRAG tags its answer with "LEGACY:").
+    assert out.get("grounded") is True
+    assert "LEGACY" in out["response"]
+    assert len(brain.converse_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_om_question_with_grounded_brain_accepted():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    router = DummyRouter(label="OM_QUESTION", reply=None)
+    brain = DummyBrain(result=SimpleResult(reply="Serenicare covers dental.", used_knowledge=True))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("what does serenicare cover", session_id, "1")
+
+    assert out["response"] == "Serenicare covers dental."
+    assert out.get("grounded") is not True
+
+
+@pytest.mark.asyncio
+async def test_router_skipped_while_pending_quote_offer():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    sm.update_session(session_id, {"context": {"pending_quote_offer": True}})
+    router = DummyRouter(label="GREETING", reply="greeting should be ignored")
+    brain = DummyBrain(result=SimpleResult(reply="quote-confirmation handled"), decision="other")
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain, intent_router=router)
+
+    out = await conv.process("yes please", session_id, "1")
+
+    # Pending state is resolved by the brain bridge, not the router.
+    assert out["response"] == "quote-confirmation handled"
+    assert len(router.calls) == 0
+    assert len(brain.confirm_calls) == 1
+    assert len(brain.converse_calls) == 1

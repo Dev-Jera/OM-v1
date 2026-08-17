@@ -34,6 +34,42 @@ synonyms:
     - term life
     - death benefit
 
+  # How-to / payment vocabulary so the bot surfaces the actual payment/application
+  # chunks (which describe UAPLIFE, merchant code, *185#, forms) instead of falling back.
+  pay:
+    - payment methods
+    - pay your premium
+    - mobile money
+    - UAPLIFE
+    - merchant code
+    - deposit
+  premium:
+    - premiums
+    - pay your premium
+    - contributions
+  apply:
+    - how do i apply
+    - application form
+    - application
+    - requirements
+  claim:
+    - claims
+    - make a claim
+    - benefits payable
+    - claim process
+  renew:
+    - renewal
+    - renew my policy
+  contributions:
+    - contribute
+    - make contributions
+    - premium payments
+  minimum investment:
+    - minimum lump sum
+    - purchase units
+    - investment advisor
+    - initial amount
+
   motor private:
     - car insurance
     - vehicle insurance

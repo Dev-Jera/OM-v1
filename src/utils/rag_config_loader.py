@@ -38,10 +38,12 @@ class HybridRetrievalConfig(BaseModel):
     enabled: bool = False
     dense_weight: float = 0.7
     sparse_weight: float = 0.3
+    rrf_k: int = 60  # reciprocal-rank-fusion constant (higher = smoother)
 
 
 class RetrievalConfig(BaseModel):
     top_k: int = 5
+    fetch_k: Optional[int] = None  # candidate pool; default min(top_k*2, 20)
     hybrid: HybridRetrievalConfig = Field(default_factory=HybridRetrievalConfig)
 
 

@@ -46,8 +46,10 @@ def _make_filters_key(filters: Optional[Dict[str, Any]]) -> str:
         return str(filters)
 
 
-def _rerank_by_term_overlap(hits: List[Dict[str, Any]], search_query: str) -> None:
-    """Sort hits in place: prefer chunks whose title/text/doc_id contain more query terms."""
+def _rerank_by_term_overlap(hits: List[Dict[str, Any]], search_query: str, fusion_scores: Optional[Dict[str, float]] = None) -> None:
+    """Sort hits in place: primary = fusion/raw score, query-term overlap is a tiebreaker only.
+    When fusion_scores (RRF) are provided, they replace the raw store score so dense
+    (cosine) and sparse (BM25) scales don't fight each other."""
     if not hits or not search_query.strip():
         return
     terms = {t.lower() for t in search_query.split() if len(t) >= _MIN_TERM_LEN}
@@ -60,9 +62,26 @@ def _rerank_by_term_overlap(hits: List[Dict[str, Any]], search_query: str) -> No
     def sort_key(h: Dict[str, Any]) -> tuple:
         ov = overlap_score(h)
         sc = float(h.get("score") or 0)
-        return (-ov, -sc)
+        if fusion_scores is not None:
+            sc = float(fusion_scores.get(h["id"], 0.0))
+        return (-sc, -ov)
 
     hits.sort(key=sort_key)
+
+
+def _rrf_scores(dense_hits: List[Dict[str, Any]], sparse_hits: List[Dict[str, Any]], rrf_k: int = 60) -> Dict[str, float]:
+    """Fuse two ranked lists by position (Reciprocal Rank Fusion).
+
+    Adds 1/(rrf_k + rank) per list a chunk appears in, using rank position only.
+    This is immune to the scale mismatch between cosine similarity (~0-1) and raw
+    BM25 scores (0-20+).
+    """
+    scores: Dict[str, float] = {}
+    for rank, h in enumerate(dense_hits, start=1):
+        scores[h["id"]] = scores.get(h["id"], 0.0) + 1.0 / (rrf_k + rank)
+    for rank, h in enumerate(sparse_hits, start=1):
+        scores[h["id"]] = scores.get(h["id"], 0.0) + 1.0 / (rrf_k + rank)
+    return scores
 
 
 def _embedder_from_config(cfg: RAGConfig):
@@ -162,7 +181,7 @@ def retrieve_context(
         store = _vector_store_from_config(cfg)
 
         # Fetch extra candidates so we can re-rank by product-term overlap (e.g. "Somesa" in chunk)
-        fetch_k = min(top_k * 2, 20)
+        fetch_k = cfg.retrieval.fetch_k or min(top_k * 2, 20)
 
         embed_start = time.monotonic()
         logger.debug(f"Embedding query: {search_query[:100]}...")
@@ -220,6 +239,7 @@ def retrieve_context(
         logger.info(f"Retrieved {len(hits)} hits from vector store")
 
         bm25_ms = 0.0
+        bm25_hits: List[Dict[str, Any]] = []
         if cfg.retrieval.hybrid.enabled:
             from src.rag.keyword_search import BM25KeywordSearch
 
@@ -229,19 +249,22 @@ def retrieve_context(
             if bm25.load_index():
                 bm25_hits = bm25.search(query=search_query, top_k=fetch_k, filters=filters)
                 logger.info(f"BM25 returned {len(bm25_hits)} hits")
-                seen = {h["id"] for h in hits}
-                for h in bm25_hits:
-                    if h["id"] not in seen and len(hits) < fetch_k:
-                        hits.append(h)
-                        seen.add(h["id"])
-                hits = hits[:fetch_k]
             else:
                 logger.warning("BM25 index not found, skipping hybrid merge")
             bm25_ms = (time.monotonic() - bm25_start) * 1000
 
-        # Re-rank: prefer chunks that contain query/product terms (e.g. "Somesa" in title/text)
+        # Re-rank: fuse dense + sparse by position (RRF) so their incompatible score
+        # scales (cosine vs raw BM25) don't fight each other; then prefer chunks that
+        # contain the query/product terms (e.g. "Somesa" in title/text).
         rerank_start = time.monotonic()
-        _rerank_by_term_overlap(hits, search_query)
+        rrf_k = cfg.retrieval.hybrid.rrf_k
+        fusion_scores = _rrf_scores(hits, bm25_hits, rrf_k) if bm25_hits else None
+        seen_ids = {h["id"] for h in hits}
+        for h in bm25_hits:
+            if h["id"] not in seen_ids:
+                hits.append(h)
+                seen_ids.add(h["id"])
+        _rerank_by_term_overlap(hits, search_query, fusion_scores=fusion_scores)
         final_hits = hits[:top_k]
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         logger.info(f"Returning {len(final_hits)} hits after reranking")

@@ -47,6 +47,7 @@ from src.chatbot.flows.registry import get_flow_steps
 from src.chatbot.state_manager import StateManager
 from src.chatbot.validation import FormValidationError
 from src.chatbot.brain import ConversationalBrain
+from src.chatbot.intent_classifier import IntentRouter
 from src.rag.generate import (
     CANNOT_ANSWER_MESSAGE,
     ERROR_RETRY_MESSAGE,
@@ -350,7 +351,18 @@ rag_adapter = APIRAGAdapter()
 # grounding + quote detection). Auto-disables when the Gemini key is missing.
 conversational_brain = ConversationalBrain(retrieve_fn=rag_adapter.retrieve)
 
-conversational_mode = ConversationalMode(rag_adapter, product_matcher, state_manager, brain=conversational_brain)
+# LLM-first intent router: decides greeting/small-talk vs Old Mutual questions
+# so casual chat (any wording) is answered without RAG and Old Mutual questions
+# are answered strictly from retrieved chunks.
+conversational_intent_router = IntentRouter()
+
+conversational_mode = ConversationalMode(
+    rag_adapter,
+    product_matcher,
+    state_manager,
+    brain=conversational_brain,
+    intent_router=conversational_intent_router,
+)
 guided_mode = GuidedMode(state_manager, product_matcher, postgres_db)
 chat_router = ChatRouter(conversational_mode, guided_mode, state_manager, product_matcher)
 product_card_gen = ProductCardGenerator(product_matcher, rag_adapter)

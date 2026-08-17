@@ -59,6 +59,8 @@ CONVERSATION RULES:
   human agent (without mentioning any tools or search).
 
 KNOWLEDGE GROUNDING:
+- ALWAYS call `search_knowledge_base` before answering any question about Old
+  Mutual products, coverage, benefits, pricing, claims, or services.
 - Any fact about Old Mutual products comes from the `search_knowledge_base` tool.
 - NEVER invent facts, figures, benefits, prices, or product details.
 - NEVER answer Old Mutual questions from your own general knowledge or memory.
@@ -109,8 +111,10 @@ _TOOLS: List[Dict[str, Any]] = [
                 "description": (
                     "Search the Old Mutual knowledge base for facts about products, "
                     "coverage, benefits, eligibility, exclusions, pricing, claims, and "
-                    "services. Use this for ANY Old Mutual factual question. Returns "
-                    "relevant document excerpts that are the ONLY allowed source of facts."
+                    "services. ALWAYS call this tool BEFORE answering any question about "
+                    "Old Mutual products - never answer such a question without its "
+                    "results. Returns relevant document excerpts that are the ONLY "
+                    "allowed source of facts."
                 ),
                 "parameters": {
                     "type": "object",

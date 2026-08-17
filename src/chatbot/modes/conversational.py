@@ -600,11 +600,15 @@ def _metric_payload(metric_type: str, value: float, conversation_id: Optional[st
 
 
 class ConversationalMode:
-    def __init__(self, rag_system, product_matcher, state_manager, brain=None):
+    def __init__(self, rag_system, product_matcher, state_manager, brain=None, intent_router=None):
         self.rag = rag_system
         self.product_matcher = product_matcher
         self.state_manager = state_manager
         self.brain = brain
+
+        # Optional LLM-based intent router (LLM-first greeting vs OM-question).
+        # Wired explicitly by the app; None keeps the legacy/brain fallback path.
+        self.intent_router = intent_router
 
         # Optional LLM-based small-talk responder.
         try:
@@ -730,12 +734,45 @@ class ConversationalMode:
                 ctx.pop("pending_product_choice", None)
                 self.state_manager.update_session(session_id, {"context": ctx})
 
+        # LLM-first intent routing: the LLM decides whether this is casual chat
+        # (greeting/small-talk/thanks/goodbye/off-topic) or a real Old Mutual
+        # question. Casual chat is answered here, skipping RAG entirely; Old
+        # Mutual questions fall through to the brain / keyword RAG below and are
+        # expected to be answered ONLY from retrieved chunks.
+        require_grounding = False
+        if form_data is None:
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            pending_state = bool(
+                ctx.get("pending_agent_offer")
+                or ctx.get("pending_section_offer")
+                or ctx.get("pending_product_choice")
+                or ctx.get("pending_quote_offer")
+            )
+            if not pending_state:
+                routed = await self._route_intent(message)
+                if routed is not None and routed[0] == "REPLY":
+                    label, llm_reply = routed[1], routed[2]
+                    return self._build_no_retrieval_response(
+                        kind=label,
+                        answer_text=llm_reply or self._build_no_retrieval_reply(label),
+                        message=message,
+                        session_id=session_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        db=db,
+                        start_time=start_time,
+                    )
+                if routed is not None and routed[0] == "PASSTHROUGH":
+                    require_grounding = bool(routed[1])
+
         # Conversational brain: free-text messages route through the brain when
         # it is attached and usable. If the brain returns None (disabled or
         # unavailable) we fall through to the keyword/RAG pipeline below.
         if form_data is None and self.brain is not None:
             brain_payload = await self._process_with_brain(
-                message, session_id, user_id, conversation_id, db, start_time
+                message, session_id, user_id, conversation_id, db, start_time,
+                require_grounding=require_grounding,
             )
             if brain_payload is not None:
                 return brain_payload
@@ -1215,6 +1252,32 @@ class ConversationalMode:
             "show_handover_button": show_handover_button,
         }
 
+    async def _route_intent(self, message: str):
+        """Route one message through the LLM intent router.
+
+        Returns ``None`` when the router is unavailable or undecided (caller
+        falls through to the brain / RAG pipeline), or a tuple:
+
+        * ``("REPLY", label, reply)`` - answer immediately, no retrieval.
+        * ``("PASSTHROUGH", require_grounding)`` - continue to the brain; when
+          ``require_grounding`` is True the brain's answer must come from chunks.
+        """
+        router = getattr(self, "intent_router", None)
+        if router is None:
+            return None
+        try:
+            label, reply = await router.route(message)
+        except Exception as exc:
+            logger.warning("IntentRouter failed; falling through to brain/RAG: %s", exc, exc_info=True)
+            return None
+
+        if label in ("OM_QUESTION", "QUOTE"):
+            return ("PASSTHROUGH", label == "OM_QUESTION")
+        if label in ("GREETING", "SMALL_TALK", "THANKS", "GOODBYE", "OFF_TOPIC"):
+            return ("REPLY", label, reply)
+        # UNKNOWN / unexpected label -> fall through to the normal pipeline.
+        return None
+
     async def _process_with_brain(
         self,
         message: str,
@@ -1223,6 +1286,7 @@ class ConversationalMode:
         conversation_id: Optional[str],
         db,
         start_time: float,
+        require_grounding: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Route one free-text message through the ConversationalBrain.
@@ -1276,6 +1340,23 @@ class ConversationalMode:
         )
         if result is None:
             return None
+
+        # Chunk-only guarantee: when the intent router flagged this as an Old
+        # Mutual question but the brain answered WITHOUT retrieving from the
+        # knowledge base, force a grounded regeneration so facts come strictly
+        # from the chunks (never the model's own general knowledge).
+        if require_grounding and not result.quote_requested and not getattr(result, "used_knowledge", False):
+            grounded = await self._force_grounded_reply(
+                message=message,
+                session_id=session_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                db=db,
+                start_time=start_time,
+                recent_history=recent_history,
+            )
+            if grounded is not None:
+                return grounded
 
         products_matched = [p[2]["name"] for p in self.product_matcher.match_products(message, top_k=3)]
         suggested_action = None
@@ -1346,6 +1427,79 @@ class ConversationalMode:
                 logger.warning("[metrics] Failed to record brain conversation event: %s", exc)
 
         return payload
+
+    async def _force_grounded_reply(
+        self,
+        *,
+        message: str,
+        session_id: str,
+        user_id: str,
+        conversation_id: Optional[str],
+        db,
+        start_time: float,
+        recent_history: List[Dict],
+    ) -> Optional[Dict[str, Any]]:
+        """Re-run an Old Mutual question strictly from retrieved chunks.
+
+        Used when the brain answered without retrieving the knowledge base, so
+        the reply can never come from the model's own general knowledge.
+        """
+        retrieval_results = await self.rag.retrieve(query=message, filters=None, top_k=None)
+        response = await self._generate_with_optional_original_question(
+            query=message,
+            context_docs=retrieval_results,
+            conversation_history=recent_history,
+            original_question=message,
+        )
+        answer = response.get("answer")
+        if not answer:
+            return None
+
+        confidence = _estimate_response_confidence(response, retrieval_results, [], {})
+        offer_agent = bool(response.get("offer_human")) or (not retrieval_results and confidence < 0.35)
+        if offer_agent:
+            sess = self.state_manager.get_session(session_id) or {}
+            ctx = dict(sess.get("context") or {})
+            ctx["pending_agent_offer"] = True
+            self.state_manager.update_session(session_id, {"context": ctx})
+
+        _emit_metrics(
+            db,
+            [
+                _metric_payload("response_latency", time.time() - start_time, conversation_id),
+                _metric_payload("confidence_score", confidence, conversation_id),
+            ],
+        )
+        if hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id or session_id,
+                    event_type="intent",
+                    payload={
+                        "intent": "general",
+                        "intent_type": "GROUNDED",
+                        "confidence": confidence,
+                        "user_message": message,
+                        "response_latency": time.time() - start_time,
+                        "used_knowledge": True,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[metrics] Failed to record grounded event: %s", exc)
+
+        return {
+            "mode": "conversational",
+            "response": answer,
+            "sources": response.get("sources", []),
+            "products_matched": [p[2]["name"] for p in self.product_matcher.match_products(message, top_k=3)],
+            "intent": "general",
+            "intent_type": "INFORMATIONAL",
+            "suggested_action": None,
+            "confidence": confidence,
+            "show_handover_button": offer_agent,
+            "brain": True,
+            "grounded": True,
+        }
 
     async def _process_product_guide_action(self, form_data: Dict[str, Any], session_id: str) -> Dict:
         action = str(form_data.get("action") or "").strip()
@@ -1601,10 +1755,62 @@ class ConversationalMode:
         if kind == "GOODBYE":
             return "You’re welcome. Feel free to come back any time you need help with Old Mutual products or services."
         if kind == "SMALL_TALK":
-            return "I’m doing well, thank you for asking. How can I help you with Old Mutual products or services today?"
+            return "I'm doing well, thank you for asking. How can I help you with Old Mutual products or services today?"
+        if kind == "OFF_TOPIC":
+            return "I only help with Old Mutual products and services. What would you like to know?"
 
         # Fallback – should rarely be hit.
         return "How can I help you with Old Mutual products or services today?"
+
+    def _build_no_retrieval_response(
+        self,
+        *,
+        kind: str,
+        answer_text: str,
+        message: str,
+        session_id: str,
+        user_id: str,
+        conversation_id: Optional[str],
+        db,
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """Build the response payload for a NO_RETRIEVAL intent (no RAG)."""
+        _emit_metrics(
+            db,
+            [_metric_payload("response_latency", time.time() - start_time, conversation_id)],
+        )
+
+        if hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id or session_id,
+                    event_type="intent",
+                    payload={
+                        "intent": str(kind).lower(),
+                        "intent_type": "NO_RETRIEVAL",
+                        "confidence": 1.0,
+                        "user_message": message,
+                        "response_latency": time.time() - start_time,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[metrics] Failed to record conversation event: %s", exc)
+
+        payload = {
+            "mode": "conversational",
+            "response": answer_text,
+            "sources": [],
+            "products_matched": [],
+            "intent": str(kind).lower(),
+            "intent_type": "NO_RETRIEVAL",
+            "suggested_action": None,
+            "confidence": 1.0,
+        }
+
+        if str(kind).upper() == "GOODBYE":
+            self.state_manager.end_session(session_id, ended_by="bot")
+
+        return payload
 
     def _get_recent_history(self, session_id: str, limit: int = 10) -> List[Dict]:
         """Get recent conversation history.
