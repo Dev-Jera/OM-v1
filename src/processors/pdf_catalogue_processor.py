@@ -21,6 +21,11 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise RuntimeError("PyPDF2 is required for PDF ingestion. Install dependencies from requirements.txt.") from exc
 
+try:
+    import pdfplumber  # optional: much better text/table extraction
+except ImportError:  # pragma: no cover - pdfplumber is optional
+    pdfplumber = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -198,6 +203,35 @@ class PDFCatalogueProcessor:
         )
 
     def _iter_pdf_pages(self, pdf_path: Path) -> Iterable[tuple[int, str]]:
+        if pdfplumber is not None:
+            try:
+                with pdfplumber.open(str(pdf_path)) as pdf:
+                    for i, page in enumerate(pdf.pages, start=1):
+                        text = _normalize_text(page.extract_text() or "")
+                        # Append table rows so tabular data (e.g. bank account
+                        # tables) is preserved as structured, searchable text
+                        # instead of being lost to layout flattening.
+                        try:
+                            tables = page.extract_tables()
+                        except Exception:  # pragma: no cover - defensive
+                            tables = []
+                        if tables:
+                            table_lines = []
+                            for table in tables:
+                                for row in table:
+                                    cells = [(c or "").replace("\n", " ").strip() for c in row]
+                                    cells = [c for c in cells if c]
+                                    if cells:
+                                        table_lines.append(" | ".join(cells))
+                            table_text = "\n".join(table_lines)
+                            if table_text:
+                                text = f"{text}\n{table_text}".strip() if text else table_text
+                        if text:
+                            yield i, text
+                return
+            except Exception as exc:  # pragma: no cover - fall back to PyPDF2
+                logger.warning("pdfplumber extraction failed, falling back to PyPDF2: %s", exc)
+
         reader = PdfReader(str(pdf_path))
         for i, page in enumerate(reader.pages, start=1):
             text = _normalize_text(page.extract_text() or "")

@@ -83,6 +83,54 @@ synonyms:
     - gadget insurance
     - item cover
 
+  umbrella trust fund:
+    - OMIG
+    - OMIG Umbrella Trust Fund
+    - umbrella fund
+    - unit trust
+    - unit trust fund
+    - pension fund
+    - retirement fund
+  "unit trust":
+    - unit trust fund
+    - umbrella trust fund
+    - OMIG
+    - mutual fund
+    - investment fund
+  omig:
+    - Old Mutual Investment Group
+    - umbrella trust fund
+    - money market fund
+    - balanced fund
+    - unit trust
+  bank account:
+    - bank details
+    - account number
+    - deposit
+    - transfer
+    - direct transfer
+    - standard chartered
+    - stanbic
+    - housing finance bank
+    - centenary bank
+    - equity bank
+    - MTN mobile money
+    - OMIGUMB
+  fund transfer:
+    - deposit
+    - pay into fund
+    - transfer money
+    - contribute
+    - mobile money
+    - bank transfer
+    - OMIGUMB
+  deposit:
+    - fund transfer
+    - pay in
+    - invest
+    - bank account
+    - mobile money
+
 # Category mappings
 categories:
   health:

@@ -27,6 +27,22 @@ if [ "${RUN_PDF_CATALOGUE_INGEST_ON_START:-true}" = "true" ]; then
   else
     echo "[startup] PDF catalogue not found at '$PDF_PATH'. Skipping ingestion."
   fi
+
+  PDF_PATH2="${FUND_TRANSFER_PDF_PATH:-data/raw/knowledge/DIFFERENT_MODES_OF_FUND_TRANSFER_-_UNIT_TRUST_INVESTMENT.pdf}"
+  if [ -f "$PDF_PATH2" ]; then
+    echo "[startup] Running fund transfer PDF ingestion into vector store..."
+    if python scripts/add_pdf_catalogue_to_kb.py \
+      --pdf-path "$PDF_PATH2" \
+      --skip-append \
+      --skip-bm25 \
+      --skip-vector-if-doc-exists; then
+      echo "[startup] Fund transfer PDF ingestion step completed."
+    else
+      echo "[startup] Fund transfer PDF ingestion failed, continuing to API startup."
+    fi
+  else
+    echo "[startup] Fund transfer PDF catalogue not found at '$PDF_PATH2'. Skipping ingestion."
+  fi
 else
   echo "[startup] RUN_PDF_CATALOGUE_INGEST_ON_START=false, skipping PDF ingestion."
 fi

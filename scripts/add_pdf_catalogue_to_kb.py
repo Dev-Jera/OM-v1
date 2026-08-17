@@ -100,6 +100,8 @@ def _qdrant_doc_exists(rag_cfg: Any, doc_id: str) -> bool:
     if provider not in ("qdrant_http", "qdrant_local"):
         return False
 
+    import os
+
     from qdrant_client import QdrantClient
     from qdrant_client.http import models as qm
 
@@ -107,7 +109,12 @@ def _qdrant_doc_exists(rag_cfg: Any, doc_id: str) -> bool:
     if provider == "qdrant_local":
         client = QdrantClient(path=rag_cfg.vector_store.path or "data/qdrant")
     else:
-        client = QdrantClient(host=rag_cfg.vector_store.host or "localhost", port=rag_cfg.vector_store.port or 6333)
+        url = os.environ.get("QDRANT_URL") or rag_cfg.vector_store.url
+        api_key = os.environ.get("QDRANT_API_KEY") or rag_cfg.vector_store.api_key
+        client = QdrantClient(url=url, api_key=api_key) if url else QdrantClient(
+            host=rag_cfg.vector_store.host or "localhost",
+            port=rag_cfg.vector_store.port or 6333,
+        )
 
     try:
         points, _next = client.scroll(
