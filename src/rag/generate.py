@@ -140,6 +140,10 @@ class MiaGenerator:
             ).rstrip("/")
             self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
             self.openrouter_timeout = 180
+            # Ignore HTTP(S)_PROXY/ALL_PROXY env vars (e.g. PaaS-hosted services)
+            # so the OpenRouter call always goes direct.
+            self._http = requests.Session()
+            self._http.trust_env = False
         else:
             from google import genai
             api_key = os.environ.get("GEMINI_API_KEY")
@@ -362,7 +366,7 @@ class MiaGenerator:
 
         def _sync_generate(prompt: str, max_output_tokens: int = 1200):
             if self.provider == "openrouter":
-                http_response = requests.post(
+                http_response = self._http.post(
                     f"{self.openrouter_base_url}/chat/completions",
                     headers={
                         "Authorization": f"Bearer {self.openrouter_api_key}",

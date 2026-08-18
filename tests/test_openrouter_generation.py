@@ -17,14 +17,17 @@ class _FakeResp:
         return self._json
 
 
-def _patch_requests_post(monkeypatch, responses):
+def _patch_requests_session(monkeypatch, responses):
     captured = {"calls": []}
 
-    def fake_post(url=None, **kwargs):
-        captured["calls"].append({"url": url, **kwargs})
-        return responses.pop(0)
+    class _FakeSession:
+        trust_env = True
 
-    monkeypatch.setattr("src.rag.generate.requests.post", fake_post)
+        def post(self, url=None, **kwargs):
+            captured["calls"].append({"url": url, **kwargs})
+            return responses.pop(0)
+
+    monkeypatch.setattr("src.rag.generate.requests.Session", lambda: _FakeSession())
     return captured
 
 
@@ -34,7 +37,7 @@ async def test_openrouter_uses_chat_completions_with_system_instruction(monkeypa
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 
-    captured = _patch_requests_post(
+    captured = _patch_requests_session(
         monkeypatch, [_FakeResp(200, _chat_completion("OpenRouter answer", "stop"))]
     )
 
@@ -58,7 +61,7 @@ async def test_openrouter_continuation_on_length_finish(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
-    captured = _patch_requests_post(
+    captured = _patch_requests_session(
         monkeypatch,
         [
             _FakeResp(200, _chat_completion("First part of the answer,", "length")),
@@ -79,7 +82,7 @@ async def test_openrouter_quota_error_maps_to_quota_and_retry_message(monkeypatc
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
-    _patch_requests_post(
+    _patch_requests_session(
         monkeypatch,
         [
             _FakeResp(429, None, "You exceeded your current quota"),
