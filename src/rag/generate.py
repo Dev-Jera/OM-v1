@@ -40,6 +40,17 @@ def is_system_error_answer(text: str) -> bool:
     return bool(lowered) and "please try again in a moment" in lowered
 
 
+def classify_generation_error(exc: Exception) -> str:
+    """Map a generator exception to a coarse error bucket for analytics."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if any(k in name or k in text for k in ("resour", "quota", "429", "rate limit", "exhausted")):
+        return "quota"
+    if any(k in name or k in text for k in ("timeout", "deadline", "readtimeout")):
+        return "timeout"
+    return "exception"
+
+
 SYSTEM_INSTRUCTION = """
 You are MIA, the Senior Virtual Assistant for Old Mutual Uganda.
 CRITICAL RULES:
@@ -117,6 +128,7 @@ class MiaGenerator:
         self.min_score = min_score
         self.max_sources = max_sources
         self.temperature = temperature
+        self.last_error_kind: Optional[str] = None
 
     def _build_history_summary(self, conversation_history: List[Dict]) -> str:
         if not conversation_history:
@@ -254,6 +266,7 @@ class MiaGenerator:
             return {}
 
     async def generate(self, question: str, hits: List[Dict[str, Any]], conversation_history: List[Dict] = None) -> str:
+        self.last_error_kind = None
         context, num_sources, _ = self._build_context(hits)
 
         context_note = (
@@ -321,6 +334,7 @@ class MiaGenerator:
                 text = (getattr(response, "text", "") or "").strip()
                 if not text:
                     logger.warning("GenAI returned empty text response.")
+                    self.last_error_kind = "empty_output"
                     return ERROR_RETRY_MESSAGE
 
                 # Request a continuation only when Gemini itself reports the output
@@ -358,6 +372,7 @@ class MiaGenerator:
                 logger.info("Successfully generated response from Gemini API")
                 return strip_meta_lead_in(text)
             except Exception as e:
+                self.last_error_kind = classify_generation_error(e)
                 if attempt >= max_attempts:
                     logger.error(f"GenAI error when generating response: {type(e).__name__}: {e}", exc_info=True)
                     break

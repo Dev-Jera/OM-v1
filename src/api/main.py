@@ -52,6 +52,7 @@ from src.rag.generate import (
     CANNOT_ANSWER_MESSAGE,
     ERROR_RETRY_MESSAGE,
     MiaGenerator,
+    classify_generation_error,
     is_system_error_answer,
 )
 from src.rag.query import retrieve_context
@@ -329,6 +330,7 @@ class APIRAGAdapter:
                     "confidence": 0.0,
                     "sources": context_docs,
                     "error": True,
+                    "error_kind": classify_generation_error(e),
                 }
 
             # System error: the generator itself failed or returned nothing.
@@ -338,6 +340,10 @@ class APIRAGAdapter:
                     "confidence": 0.0,
                     "sources": context_docs,
                     "error": True,
+                    "error_kind": (
+                        getattr(mia, "last_error_kind", None)
+                        or ("empty_output" if not answer else "system_error")
+                    ),
                 }
 
             return {"answer": answer, "confidence": _compute_confidence(), "sources": context_docs}
@@ -747,6 +753,10 @@ class CSATFeedbackRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
+class LinkZohoContactRequest(BaseModel):
+    zoho_contact_id: str = Field(..., min_length=1, description="Zoho contact id to link")
+
+
 class ChatConsoleReplyRequest(BaseModel):
     message: str = Field(..., min_length=1, description="Agent reply text")
     agent_id: Optional[str] = Field(default="agent", description="Agent identifier")
@@ -832,31 +842,24 @@ async def get_system_performance_metrics(
     def _delta(current: float, previous: float) -> float:
         return round(current - previous, 2)
 
-    current_conversations = db.count_conversations(current_start, now)
-    previous_conversations = db.count_conversations(previous_start, current_start)
-    current_escalations = len(
-        db.list_conversation_events(
-            start=current_start,
-            end=now,
-            event_type="escalation_confirmed",
-            limit=50000,
-        )
-    )
-    previous_escalations = len(
-        db.list_conversation_events(
-            start=previous_start,
-            end=current_start,
-            event_type="escalation_confirmed",
-            limit=50000,
-        )
-    )
+    from src.metrics_outcomes import compute_conversation_outcomes
 
-    escalation_rate = _rate(current_escalations, current_conversations)
-    escalation_rate_prev = _rate(previous_escalations, previous_conversations)
+    def _verdict_total(outcomes: Dict[str, Any]) -> int:
+        return sum(
+            outcomes.get(k, 0)
+            for k in ("resolved", "unresolved", "escalated", "bot_down")
+        )
+
+    current = compute_conversation_outcomes(db, current_start, now)
+    previous = compute_conversation_outcomes(db, previous_start, current_start)
+
+    escalation_rate = _rate(current["escalated"], current["total"])
+    escalation_rate_prev = _rate(previous["escalated"], previous["total"])
     escalation_change = _delta(escalation_rate, escalation_rate_prev)
 
-    resolution_rate = _rate(max(current_conversations - current_escalations, 0), current_conversations)
-    resolution_rate_prev = _rate(max(previous_conversations - previous_escalations, 0), previous_conversations)
+    # Strict resolution: only conversations with a clear verdict count.
+    resolution_rate = _rate(current["resolved"], _verdict_total(current))
+    resolution_rate_prev = _rate(previous["resolved"], _verdict_total(previous))
     resolution_change = _delta(resolution_rate, resolution_rate_prev)
 
     current_success = db.count_payment_transactions(current_start, now, ["SUCCESS", "COMPLETED"])
@@ -951,7 +954,11 @@ async def get_ai_performance_metrics(
         rag = db.list_rag_metrics(
             start=start,
             end=end,
-            metric_types=["retrieval_accuracy", "confidence_score", "response_latency", "fallbacks"],
+            metric_types=[
+                "retrieval_accuracy",
+                "confidence_score",
+                "response_latency",
+            ],
             limit=50000,
         )
         by_type: Dict[str, List[float]] = defaultdict(list)
@@ -961,29 +968,40 @@ async def get_ai_performance_metrics(
         accuracy = _avg(by_type["retrieval_accuracy"]) * 100
         confidence = _avg(by_type["confidence_score"]) * 100
         latency = _avg(by_type["response_latency"])
-        fallbacks = len(by_type["fallbacks"])
 
-        conversations = db.count_conversations(start, end)
-        escalations = len(
-            db.list_conversation_events(
-                start=start,
-                end=end,
-                event_type="escalation_confirmed",
-                limit=50000,
-            )
-        )
+        from src.metrics_outcomes import compute_conversation_outcomes
+
+        outcomes = compute_conversation_outcomes(db, start, end)
+        conversations = outcomes["total"]
+        resolved = outcomes["resolved"]
+        unresolved = outcomes["unresolved"]
+        escalations = outcomes["escalated"]
+        bot_down = outcomes["bot_down"]
+        no_verdict = outcomes["no_verdict"]
+        in_progress = outcomes["in_progress"]
+        verdict_total = resolved + unresolved + escalations + bot_down
+
         agent_joins = len(
-            db.list_conversation_events(
-                start=start,
-                end=end,
-                event_type="agent_joined",
-                limit=50000,
-            )
+            {
+                e.conversation_id
+                for e in db.list_conversation_events(
+                    start=start,
+                    end=end,
+                    event_type="agent_joined",
+                    limit=50000,
+                )
+                if e.conversation_id
+            }
         )
 
+        # Honest rates derived from the single outcome model.
+        resolution_rate = _rate(resolved, verdict_total)
+        self_serve = max(conversations - escalations - bot_down, 0)
+        self_serve_rate = _rate(self_serve, conversations)
         escalation_rate = _rate(escalations, conversations)
-        resolution_rate = _rate(max(conversations - escalations, 0), conversations)
-        fallback_rate = _rate(fallbacks, conversations)
+        # "Could not answer" = unresolved (content gap), one conversation each.
+        fallback_rate = _rate(unresolved, conversations)
+        bot_down_rate = _rate(bot_down, conversations)
 
         return {
             "accuracy": accuracy,
@@ -992,8 +1010,21 @@ async def get_ai_performance_metrics(
             "fallback_rate": fallback_rate,
             "escalation_rate": escalation_rate,
             "resolution_rate": resolution_rate,
+            "self_serve_rate": self_serve_rate,
             "agent_join_rate": _rate(agent_joins, conversations),
             "conversations": conversations,
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "escalated": escalations,
+            "bot_down": bot_down,
+            "no_verdict": no_verdict,
+            "in_progress": in_progress,
+            "verdict_total": verdict_total,
+            "unanswered_rate": fallback_rate,
+            "bot_down_rate": bot_down_rate,
+            "resolved_outcomes": resolved,
+            "unresolved_outcomes": unresolved,
+            "completion_outcome_rate": _rate(resolved, resolved + unresolved),
         }
 
     current = _window_metrics(current_start, now)
@@ -1350,11 +1381,11 @@ async def get_ai_performance_metrics(
         rag_by_type[m.metric_type].append(float(m.value))
     retrieval_success = _avg(rag_by_type["retrieval_accuracy"]) * 100
     avg_latency_ms = _avg(rag_by_type["response_latency"]) * 1000
-    doc_relevance = _avg(rag_by_type["confidence_score"]) * 10
+    doc_relevance = _avg(rag_by_type["confidence_score"])
 
     rag_context_rows = [
         {"doc": "Retrieval Accuracy", "accuracy": _fmt_pct(retrieval_success, 1)},
-        {"doc": "Confidence Score", "accuracy": f"{doc_relevance:.1f}/10"},
+        {"doc": "Confidence Score", "accuracy": _fmt_pct(doc_relevance * 100, 1)},
         {"doc": "Fallback Rate", "accuracy": _fmt_pct(current["fallback_rate"], 1)},
     ]
 
@@ -1442,6 +1473,71 @@ async def get_ai_performance_metrics(
         for reason, count in reason_counts.most_common(4)
     ]
 
+    path_events = db.list_conversation_events(
+        start=current_start,
+        end=now,
+        event_type="conversation_path",
+        limit=50000,
+    )
+    path_by_conversation: Dict[str, str] = {}
+    for ev in path_events:
+        cid = str(getattr(ev, "conversation_id", ""))
+        if cid and cid not in path_by_conversation:
+            path_by_conversation[cid] = str((getattr(ev, "payload", {}) or {}).get("path", "freeform"))
+    path_counts = Counter(path_by_conversation.values())
+    total_paths = sum(path_counts.values())
+    path_breakdown = {
+        "guided_flow": path_counts.get("guided_flow", 0),
+        "direct_agent": path_counts.get("direct_agent", 0),
+        "freeform": path_counts.get("freeform", 0),
+        "total": total_paths,
+        "percentages": {
+            "guided_flow": _rate(path_counts.get("guided_flow", 0), total_paths),
+            "direct_agent": _rate(path_counts.get("direct_agent", 0), total_paths),
+            "freeform": _rate(path_counts.get("freeform", 0), total_paths),
+        },
+    }
+
+    escalation_confirmed_events = db.list_conversation_events(
+        start=current_start,
+        end=now,
+        event_type="escalation_confirmed",
+        limit=50000,
+    )
+    agent_joined_events = db.list_conversation_events(
+        start=current_start,
+        end=now,
+        event_type="agent_joined",
+        limit=50000,
+    )
+    join_ts_by_conv: Dict[str, Any] = {}
+    for ev in agent_joined_events:
+        cid = str(getattr(ev, "conversation_id", ""))
+        if cid and cid not in join_ts_by_conv:
+            join_ts_by_conv[cid] = getattr(ev, "created_at", None)
+    escal_ts_by_conv: Dict[str, Any] = {}
+    for ev in escalation_confirmed_events:
+        cid = str(getattr(ev, "conversation_id", ""))
+        if cid and cid not in escal_ts_by_conv:
+            escal_ts_by_conv[cid] = getattr(ev, "created_at", None)
+    time_to_agent: List[float] = []
+    for cid, join_ts in join_ts_by_conv.items():
+        escal_ts = escal_ts_by_conv.get(cid)
+        if escal_ts is not None and join_ts is not None:
+            delta = (join_ts - escal_ts).total_seconds()
+            if delta >= 0:
+                time_to_agent.append(delta)
+    avg_time_to_agent = round(sum(time_to_agent) / len(time_to_agent), 1) if time_to_agent else None
+    agent_timing = {
+        "avgTimeToAgentJoinSec": avg_time_to_agent,
+        "cases": len(time_to_agent),
+        "escalations": len(set(escal_ts_by_conv) | set(join_ts_by_conv)),
+    }
+    bot_latency = {
+        "avgResponseMs": round(avg_latency_ms),
+        "avgResponseSec": round(avg_latency_ms / 1000, 1) if avg_latency_ms else 0.0,
+    }
+
     last_hour_metrics = db.list_rag_metrics(
         start=now - timedelta(hours=1),
         end=now,
@@ -1508,6 +1604,9 @@ async def get_ai_performance_metrics(
         "ragWeaknessRows": weakness_rows,
         "learningOps": learning_ops,
         "escalationReasons": escalation_reasons,
+        "pathBreakdown": path_breakdown,
+        "agentTiming": agent_timing,
+        "botLatency": bot_latency,
         "modelHealth": model_health,
         # ---- real business counts ----
         "totalConversations": total_conversations,
@@ -1518,7 +1617,249 @@ async def get_ai_performance_metrics(
     }
 
 
-@api_router.post("/metrics/csat", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+@api_router.get("/metrics/impact", tags=["Metrics"], dependencies=[Depends(admin_auth_protection)])
+async def get_impact_metrics(
+    days: int = Query(30, ge=1, le=180),
+    db: PostgresDB = Depends(get_db),
+):
+    """
+    Insurance KPI suite for the "Bot Impact" dashboard section.
+
+    Targets are the agreed business defaults:
+      resolution >= 80%, fallback <= 15%, CSAT >= 4.2, latency < 8s,
+      off-hours handled >= 60%, quote -> payment >= 20%.
+    """
+    now = datetime.utcnow()
+    start = now - timedelta(days=days)
+
+    def _avg(values: List[float]) -> float:
+        return round(sum(values) / len(values), 4) if values else 0.0
+
+    def _rate(num: int, denom: int) -> float:
+        return round((num / denom) * 100, 2) if denom > 0 else 0.0
+
+    def _safe_int(value: Any) -> int:
+        try:
+            parsed = int(value)
+            return parsed if parsed >= 0 else 0
+        except (TypeError, ValueError):
+            return 0
+
+    # ---- window metrics from the single outcome model ----
+    from src.metrics_outcomes import compute_conversation_outcomes
+
+    outcomes = compute_conversation_outcomes(db, start, now)
+    conversations = outcomes["total"]
+    resolved = outcomes["resolved"]
+    unresolved = outcomes["unresolved"]
+    escalations = outcomes["escalated"]
+    bot_down = outcomes["bot_down"]
+    no_verdict = outcomes["no_verdict"]
+    verdict_total = resolved + unresolved + escalations + bot_down
+    self_serve = max(conversations - escalations - bot_down, 0)
+
+    # Strict resolution: only conversations with a clear verdict count.
+    resolution_rate = _rate(resolved, verdict_total)
+    # Self-serve: handled without a human and the bot was not down.
+    self_serve_rate = _rate(self_serve, conversations)
+    # "Could not answer" = unresolved (content gap); one conversation each.
+    fallback_rate = _rate(unresolved, conversations)
+    bot_down_rate = _rate(bot_down, conversations)
+
+    # ---- latency (successful bot replies only; errors record no latency) ----
+    latency_metrics = db.list_rag_metrics(
+        start=start,
+        end=now,
+        metric_types=["response_latency"],
+        limit=50000,
+    )
+    latency_values = [float(m.value) for m in latency_metrics]
+    latency_seconds = _avg(latency_values)
+
+    # ---- CSAT tied to a real conversation, split by outcome ----
+    csat_events = db.list_conversation_events(
+        start=start, end=now, event_type="csat", limit=5000
+    )
+    csat_ratings = []
+    csat_resolved_ratings = []
+    csat_escalated_ratings = []
+    for ev in csat_events:
+        rating = float((ev.payload or {}).get("rating", 0))
+        if rating <= 0:
+            continue
+        outcome = outcomes["detail"].get(str(getattr(ev, "conversation_id", "") or ""))
+        if outcome is None:
+            continue  # orphan rating: not tied to a conversation in this window
+        csat_ratings.append(rating)
+        if outcome == "resolved":
+            csat_resolved_ratings.append(rating)
+        elif outcome == "escalated":
+            csat_escalated_ratings.append(rating)
+    csat = _avg(csat_ratings)
+    csat_resolved = _avg(csat_resolved_ratings)
+    csat_escalated = _avg(csat_escalated_ratings)
+
+    # ---- off-hours handling (business hours Mon-Fri 08:00-17:00 Kampala = UTC+3) ----
+    conversation_rows = db.list_conversations(start, now)
+
+    def _is_off_hours(dt: datetime) -> bool:
+        local = dt + timedelta(hours=3)
+        if local.weekday() >= 5:
+            return True
+        return local.hour < 8 or local.hour >= 17
+
+    off_hours_total = 0
+    off_hours_handled = 0
+    for conv in conversation_rows:
+        created = getattr(conv, "created_at", None)
+        if created is None or not _is_off_hours(created):
+            continue
+        off_hours_total += 1
+        outcome = outcomes["detail"].get(str(getattr(conv, "id", "") or ""))
+        if outcome not in ("escalated", "bot_down"):
+            off_hours_handled += 1
+    off_hours_rate = _rate(off_hours_handled, off_hours_total)
+
+    # ---- quote -> payment conversion ----
+    try:
+        quotes_created = _safe_int(db.count_quotes(start, now))
+    except Exception:
+        quotes_created = 0
+    paid = _safe_int(
+        db.count_payment_transactions(
+            start, now, ["SUCCESS", "COMPLETED", "PAID", "payment_initiated"]
+        )
+    )
+    quote_to_payment_rate = _rate(paid, quotes_created)
+
+    # ---- effort hours saved (fact + clearly-labelled estimate) ----
+    effort_minutes_per_conversation = float(
+        os.getenv("EFFORT_MINUTES_PER_CONVERSATION", "4")
+    )
+    effort_hours_saved = round(self_serve * effort_minutes_per_conversation / 60.0, 2)
+
+    # ---- repeat users (Zoho contact identity when linked, else phone) ----
+    users_by_id = {str(u.id): u for u in db.list_users()}
+    user_counts: Dict[str, int] = defaultdict(int)
+    zoho_linked = 0
+    for conv in conversation_rows:
+        uid = str(getattr(conv, "user_id", "") or "")
+        if not uid:
+            continue
+        user = users_by_id.get(uid)
+        contact_id = str(getattr(user, "zoho_contact_id", "") or "") if user else ""
+        key = contact_id if contact_id else uid
+        user_counts[key] += 1
+        if contact_id:
+            zoho_linked += 1
+    active_users = len(user_counts)
+    repeat_users = sum(1 for count in user_counts.values() if count >= 2)
+    repeat_user_rate = _rate(repeat_users, active_users)
+    repeat_basis = "zoho-contact" if zoho_linked else "phone-based"
+
+    targets = {
+        "resolution_rate": 80.0,
+        "self_serve_rate": 80.0,
+        "fallback_rate": 15.0,
+        "csat": 4.2,
+        "latency_seconds": 8.0,
+        "off_hours_rate": 60.0,
+        "quote_to_payment_rate": 20.0,
+        "bot_down_rate": 5.0,
+    }
+
+    def _kpi(key: str, label: str, value: float, unit: str) -> Dict[str, Any]:
+        target = targets[key]
+        met = bool(value >= target) if unit != "pct_dn" else bool(value <= target)
+        return {
+            "key": key,
+            "label": label,
+            "value": value,
+            "target": target,
+            "met": met,
+            "unit": unit,
+        }
+
+    return {
+        "window": {
+            "days": days,
+            "conversations": conversations,
+            "escalations": escalations,
+            "botDown": bot_down,
+            "noVerdict": no_verdict,
+        },
+        "kpis": [
+            _kpi("resolution_rate", "AI Resolution (strict)", resolution_rate, "pct"),
+            _kpi("self_serve_rate", "Handled Without Agent", self_serve_rate, "pct"),
+            _kpi("fallback_rate", "Could Not Answer", fallback_rate, "pct_dn"),
+            _kpi("bot_down_rate", "Bot Down / Errors", bot_down_rate, "pct_dn"),
+            _kpi("csat", "CSAT (avg rating)", csat, "rating"),
+            _kpi("latency_seconds", "Avg Bot Latency", latency_seconds, "seconds"),
+            _kpi("off_hours_rate", "Off-Hours Handled", off_hours_rate, "pct"),
+            _kpi("quote_to_payment_rate", "Quote -> Payment", quote_to_payment_rate, "pct"),
+        ],
+        "resolution": {
+            "strict": resolution_rate,
+            "selfServe": self_serve_rate,
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "escalated": escalations,
+            "botDown": bot_down,
+            "noVerdict": no_verdict,
+            "inProgress": outcomes["in_progress"],
+            "verdictTotal": verdict_total,
+            "target": targets["resolution_rate"],
+            "basis": "Strict = confirmed 'yes' out of conversations with a verdict. "
+            "Self-serve = handled without an agent (and bot not down). "
+            "Chats with no outcome recorded are shown separately, not counted.",
+        },
+        "csat": {
+            "value": csat,
+            "responses": len(csat_ratings),
+            "resolved": csat_resolved,
+            "escalated": csat_escalated,
+            "target": targets["csat"],
+            "basis": "Only ratings tied to a conversation in this window.",
+        },
+        "latency": {"value": latency_seconds, "target": targets["latency_seconds"], "basis": "Successful bot replies only; errors record no latency."},
+        "offHours": {
+            "total": off_hours_total,
+            "handled": off_hours_handled,
+            "rate": off_hours_rate,
+            "target": targets["off_hours_rate"],
+            "businessHours": "Mon-Fri 08:00-17:00 Kampala (UTC+3)",
+            "basis": "Handled = not escalated and bot not down.",
+        },
+        "quoteToPayment": {
+            "quotes": quotes_created,
+            "paid": paid,
+            "rate": quote_to_payment_rate,
+            "target": targets["quote_to_payment_rate"],
+        },
+        "effortHoursSaved": {
+            "hours": effort_hours_saved,
+            "chats": self_serve,
+            "minutesPerConversation": effort_minutes_per_conversation,
+            "basis": "estimated",
+            "scope": "Estimate = chats handled without an agent x "
+            f"{effort_minutes_per_conversation:.0f} min each. The minutes-per-chat "
+            "assumption is adjustable; switch to 'measured' once real agent "
+            "timing data is available.",
+        },
+        "repeatUsers": {
+            "activeUsers": active_users,
+            "repeatUsers": repeat_users,
+            "repeatRate": repeat_user_rate,
+            "zohoLinked": zoho_linked,
+            "basis": repeat_basis,
+            "note": "Repeat detection keys on the Zoho contact id when a user is "
+            "linked; otherwise it falls back to the user id/phone.",
+        },
+        "targets": targets,
+    }
+
+
+@api_router.post("/metrics/csat", tags=["Metrics"])
 async def post_csat_feedback(
     body: CSATFeedbackRequest,
     db: PostgresDB = Depends(get_db),
@@ -2647,6 +2988,47 @@ async def get_conversation_history(session_id: str, limit: int = 50):
     except Exception as e:
         logger.error(f"Error getting history: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post(
+    "/admin/users/{user_id}/link-zoho-contact",
+    tags=["Admin"],
+    dependencies=[Depends(admin_auth_protection)],
+)
+async def link_user_to_zoho_contact(
+    user_id: str,
+    body: LinkZohoContactRequest,
+    db: PostgresDB = Depends(get_db),
+):
+    """
+    Link a chat user to a Zoho contact so repeat-user detection uses the
+    Zoho identity (same human across phones) instead of just the phone.
+    """
+    if not hasattr(db, "set_zoho_contact"):
+        raise HTTPException(status_code=501, detail="Zoho contact linking not supported by this database")
+    user = db.set_zoho_contact(user_id, body.zoho_contact_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "user_id": user.id,
+        "zoho_contact_id": user.zoho_contact_id,
+        "basis": "zoho-contact",
+    }
+
+
+@api_router.get("/admin/seed-demo-data", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
+async def seed_demo_data(
+    days: int = Query(30, ge=1, le=90),
+    db: PostgresDB = Depends(get_db),
+):
+    """
+    Seed synthetic demo data (conversations, events, metrics, quotes, payments)
+    so the dashboards show meaningful volumes before real traffic arrives.
+    """
+    from src.scripts.seed_demo_data import seed_demo_data as run_seed
+
+    stats = run_seed(db, days=days)
+    return {"success": True, "seeded": stats, "note": "Synthetic demo data only"}
 
 
 @api_router.get("/admin/chat-console/queue", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])

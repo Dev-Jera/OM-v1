@@ -19,6 +19,10 @@ class User:
     id: str
     phone_number: str
     kyc_completed: bool = False
+    name: Optional[str] = None
+    email: Optional[str] = None
+    identity_captured_at: Optional[datetime] = None
+    zoho_contact_id: Optional[str] = None
 
 
 @dataclass
@@ -226,12 +230,41 @@ class PostgresDB:
     def get_user_by_id(self, user_id: str) -> Optional[User]:
         return self._users.get(user_id)
 
+    def list_users(self) -> List[User]:
+        return list(self._users.values())
+
+    def set_user_identity(
+        self,
+        user_id: str,
+        name: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[User]:
+        user = self._users.get(user_id)
+        if not user:
+            return None
+        if name:
+            user.name = name
+        if email:
+            user.email = email
+        user.identity_captured_at = datetime.utcnow()
+        return user
+
+    def set_zoho_contact(self, user_id: str, zoho_contact_id: str) -> Optional[User]:
+        """Link a user to a Zoho contact so repeat-user detection uses Zoho identity."""
+        user = self._users.get(str(user_id))
+        if not user:
+            return None
+        user.zoho_contact_id = str(zoho_contact_id)
+        return user
+
     # ------------------------------------------------------------------ #
     # Conversations & messages
     # ------------------------------------------------------------------ #
-    def create_conversation(self, user_id: str, mode: str) -> Conversation:
+    def create_conversation(self, user_id: str, mode: str, created_at: Optional[datetime] = None) -> Conversation:
         conv_id = str(uuid.uuid4())
         conv = Conversation(id=conv_id, user_id=user_id, mode=mode)
+        if created_at is not None:
+            conv.created_at = created_at
         self._conversations[conv_id] = conv
         return conv
 
@@ -264,6 +297,11 @@ class PostgresDB:
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
         return self._conversations.get(str(conversation_id))
+
+    def list_conversations(self, start: datetime, end: datetime) -> List[Conversation]:
+        return [
+            c for c in self._conversations.values() if start <= c.created_at < end
+        ]
 
     def get_conversation_events(self, conversation_id: str, limit: int = 100) -> List[ConversationEvent]:
         events = [e for e in self._conversation_events if e.conversation_id == str(conversation_id)]
@@ -464,6 +502,7 @@ class PostgresDB:
         pricing_breakdown: Optional[Dict[str, Any]] = None,
         product_name: Optional[str] = None,
         status: str = "pending",
+        generated_at: Optional[datetime] = None,
     ) -> Quote:
         quote_id = str(uuid.uuid4())
         quote = Quote(
@@ -477,8 +516,21 @@ class PostgresDB:
             pricing_breakdown=pricing_breakdown,
             status=status,
         )
+        quote.generated_at = generated_at or datetime.utcnow()
         self._quotes[quote_id] = quote
         return quote
+
+    def count_quotes(self, start: datetime, end: datetime, *, exclude_statuses: Optional[List[str]] = None) -> int:
+        exclude_upper = {s.upper() for s in (exclude_statuses or [])}
+        count = 0
+        for q in self._quotes.values():
+            ts = getattr(q, "generated_at", None)
+            if ts is None or not (start <= ts < end):
+                continue
+            if exclude_upper and str(q.status).upper() in exclude_upper:
+                continue
+            count += 1
+        return count
 
     def get_quote(self, quote_id: str) -> Optional[Quote]:
         return self._quotes.get(str(quote_id))
@@ -497,8 +549,9 @@ class PostgresDB:
         currency: str,
         status: str = "PENDING",
         metadata: Optional[Dict[str, Any]] = None,
+        created_at: Optional[datetime] = None,
     ) -> PaymentTransaction:
-        now = datetime.utcnow()
+        now = created_at or datetime.utcnow()
         txn = PaymentTransaction(
             reference=str(reference),
             provider=str(provider),

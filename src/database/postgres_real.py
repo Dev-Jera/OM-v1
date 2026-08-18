@@ -92,12 +92,58 @@ class PostgresDB:
             stmt = select(User).where(User.id == user_id)
             return s.execute(stmt).scalar_one_or_none()
 
+    def list_users(self) -> List[User]:
+        with self._session() as s:
+            stmt = select(User)
+            return list(s.execute(stmt).scalars().all())
+
+    def set_user_identity(
+        self,
+        user_id: str,
+        name: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[User]:
+        """Store the client's name/email on the user record (email used for follow-up).
+
+        The name is never surfaced in analytics (masked as :clients_name).
+        """
+        with self._session() as s:
+            stmt = select(User).where(User.id == str(user_id))
+            rec = s.execute(stmt).scalar_one_or_none()
+            if not rec:
+                return None
+            if name:
+                rec.name = str(name)
+            if email:
+                rec.email = str(email)
+            rec.identity_captured_at = datetime.utcnow()
+            s.add(rec)
+            s.flush()
+            s.refresh(rec)
+            return rec
+
+    def set_zoho_contact(self, user_id: str, zoho_contact_id: str) -> Optional[User]:
+        """Link a user to a Zoho contact so repeat-user detection uses Zoho identity."""
+        with self._session() as s:
+            stmt = select(User).where(User.id == str(user_id))
+            rec = s.execute(stmt).scalar_one_or_none()
+            if not rec:
+                return None
+            rec.zoho_contact_id = str(zoho_contact_id)
+            s.add(rec)
+            s.flush()
+            s.refresh(rec)
+            return rec
+
     # ------------------------------------------------------------------ #
     # Conversations & messages
     # ------------------------------------------------------------------ #
-    def create_conversation(self, user_id: str, mode: str) -> Conversation:
+    def create_conversation(self, user_id: str, mode: str, created_at: Optional[datetime] = None) -> Conversation:
         with self._session() as s:
-            c = Conversation(id=str(uuid4()), user_id=user_id, mode=mode)
+            kwargs = {}
+            if created_at is not None:
+                kwargs["created_at"] = created_at
+            c = Conversation(id=str(uuid4()), user_id=user_id, mode=mode, **kwargs)
             s.add(c)
             s.flush()
             s.refresh(c)
@@ -250,6 +296,14 @@ class PostgresDB:
             s.add(rec)
             s.flush()
             return rec
+
+    def list_conversations(self, start: datetime, end: datetime) -> List[Conversation]:
+        with self._session() as s:
+            stmt = select(Conversation).where(
+                Conversation.created_at >= start,
+                Conversation.created_at < end,
+            )
+            return list(s.execute(stmt).scalars().all())
 
     def list_conversation_events(
         self,
@@ -414,6 +468,7 @@ class PostgresDB:
         pricing_breakdown: Optional[Dict[str, Any]] = None,
         product_name: Optional[str] = None,
         status: str = "pending",
+        generated_at: Optional[datetime] = None,
     ) -> Quote:
         with self._session() as s:
             q = Quote(
@@ -427,6 +482,8 @@ class PostgresDB:
                 pricing_breakdown=pricing_breakdown,
                 status=status,
             )
+            if generated_at is not None:
+                q.generated_at = generated_at
             s.add(q)
             s.flush()
             s.refresh(q)
@@ -451,8 +508,10 @@ class PostgresDB:
         currency: str,
         status: str = "PENDING",
         metadata: Optional[Dict[str, Any]] = None,
+        created_at: Optional[datetime] = None,
     ) -> PaymentTransaction:
         with self._session() as s:
+            now = created_at or datetime.utcnow()
             txn = PaymentTransaction(
                 reference=str(reference),
                 provider=str(provider),
@@ -462,8 +521,8 @@ class PostgresDB:
                 currency=str(currency),
                 status=str(status),
                 transaction_metadata=metadata or {},
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
+                created_at=now,
+                updated_at=now,
             )
             s.add(txn)
             s.flush()

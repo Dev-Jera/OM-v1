@@ -19,6 +19,10 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     phone_number: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, index=True)
+    identity_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    zoho_contact_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     kyc_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 

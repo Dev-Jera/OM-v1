@@ -111,6 +111,16 @@ class GuidedMode:
         if flow_name not in self.flows:
             return {"error": f"Unknown flow: {flow_name}"}
 
+        # Path attribution: a guided flow is the entry point for this conversation.
+        session = self.state_manager.get_session(session_id) or {}
+        conversation_id = session.get("conversation_id") or session_id
+        try:
+            from src.chatbot.paths import record_conversation_path
+            db = getattr(self.state_manager, "db", None)
+            record_conversation_path(db, conversation_id, "guided_flow", "start_flow")
+        except Exception:
+            pass
+
         # Switch to guided mode
         self.state_manager.switch_mode(session_id, "guided", flow=flow_name)
 

@@ -31,6 +31,16 @@ async def escalate(body: EscalateRequest):
     if not body.session_id:
         return {"success": False, "error": "Missing session_id"}
     state = state_manager.mark_escalated(body.session_id, reason=body.reason, metadata=body.metadata or {})
+    # Path attribution: a direct /escalate call means the user chose a human agent.
+    session = state_manager.get_session(body.session_id) or {}
+    conversation_id = session.get("conversation_id") or body.session_id
+    try:
+        from src.chatbot.paths import record_conversation_path
+        record_conversation_path(
+            getattr(state_manager, "db", None), conversation_id, "direct_agent", "escalate_endpoint"
+        )
+    except Exception:
+        pass
     return {"success": True, "escalated": True, "state": state}
 
 

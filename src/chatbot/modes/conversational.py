@@ -18,6 +18,83 @@ def _is_greeting(message: str) -> bool:
     return m in {"hi", "hello", "hey", "hey!", "hello!", "hi!", "good morning", "good afternoon", "good evening"}
 
 
+# --------------------------------------------------------------------------- #
+# Identity capture (greeting flow)
+#
+# When a new user greets us, Mia asks for their name and email. The name is
+# never surfaced anywhere (masked as CLIENT_NAME_MASK); the email is stored on
+# the user record and used for follow-up only.
+# --------------------------------------------------------------------------- #
+CLIENT_NAME_MASK = ":clients_name"
+
+IDENTITY_ASK_PROMPT = (
+    "Hello, I'm Mia, your Old Mutual assistant. I'd like to know your name and email address "
+    "so I can know you better and follow up with you if needed."
+)
+IDENTITY_ASK_EMAIL_PROMPT = "Thanks! Could you also share your email address so we can follow up with you?"
+IDENTITY_CONFIRMED_PROMPT = "Thank you! Noted. How can I help you today?"
+
+# --------------------------------------------------------------------------- #
+# Conversation completion (goodbye flow)
+#
+# Before a conversation ends, Mia asks whether every question was answered so
+# we can label the conversation as resolved or unresolved (honest outcome data
+# instead of inferring resolution from escalations alone).
+# --------------------------------------------------------------------------- #
+COMPLETION_ASK_PROMPT = "Did I answer everything you needed today?"
+COMPLETION_RESOLVED_PROMPT = "Great to hear! If you have anything else, I'm here for you."
+COMPLETION_UNRESOLVED_PROMPT = (
+    "I'm sorry I couldn't help with everything. Would you like me to connect you with a human agent?"
+)
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _extract_email(text: Optional[str]) -> Optional[str]:
+    m = _EMAIL_RE.search(text or "")
+    return m.group(0) if m else None
+
+
+def _extract_name(text: Optional[str], email: Optional[str] = None) -> Optional[str]:
+    t = (text or "").strip()
+    if email:
+        t = t.replace(email, " ")
+    t = re.sub(r"[,.;:!?]+", " ", t).strip()
+    m = re.search(r"\b(?:my name is|i am|i'm|call me)\s+([A-Za-z][A-Za-z' -]{1,50})", t, re.IGNORECASE)
+    if m:
+        candidate = re.split(r"\s+and\s+", m.group(1).strip(), flags=re.IGNORECASE)[0].strip()
+        if candidate:
+            return candidate[:60]
+    tokens = [
+        tok
+        for tok in re.split(r"\s+", t)
+        if tok and re.fullmatch(r"[A-Za-z][A-Za-z'.-]*", tok)
+        and tok.lower() not in {"my", "name", "is", "am", "i", "email", "address", "the", "and", "to"}
+    ]
+    if tokens:
+        return " ".join(tokens[:2])[:60]
+    return None
+
+
+def _looks_like_question(text: Optional[str]) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if t.endswith("?"):
+        return True
+    if any(
+        low.startswith(w)
+        for w in (
+            "what", "how", "why", "which", "when", "where",
+            "can ", "tell", "give", "do you", "is there", "are there",
+            "explain", "recommend", "i need", "i want",
+        )
+    ):
+        return True
+    return len(t) > 70
+
+
 def _detect_section_intent(message: str) -> str | None:
     m = (message or "").lower()
     # Benefits
@@ -631,6 +708,9 @@ class ConversationalMode:
         """Process message in conversational mode"""
         start_time = time.time()
 
+        if db is None:
+            db = getattr(self.state_manager, "db", None)
+
         session_for_id = self.state_manager.get_session(session_id) or {}
         conversation_id: Optional[str] = session_for_id.get("conversation_id") or session_id
 
@@ -669,6 +749,10 @@ class ConversationalMode:
                             event_type="escalation_confirmed",
                             payload={"source": "user", "reason": "user_requested_agent"},
                         )
+                        from src.chatbot.paths import record_conversation_path
+                        record_conversation_path(
+                            self.state_manager.db, conversation_id, "direct_agent", "keyword"
+                        )
                     except Exception:
                         pass
                 return {
@@ -703,6 +787,33 @@ class ConversationalMode:
                 "escalated": True,
                 "agent_id": agent_id,
             }
+
+        # Path attribution: a normal (non-escalated) user message here is a
+        # freeform chat. First path for the conversation wins.
+        if (message or "").strip():
+            try:
+                from src.chatbot.paths import record_conversation_path
+                record_conversation_path(db, conversation_id, "freeform", "chat")
+            except Exception:
+                pass
+
+        # Completion question: if we asked "did I answer everything?", interpret
+        # the reply as resolved / unresolved / keep chatting.
+        if form_data is None:
+            completion_response = self._maybe_handle_completion_question(
+                message, session_id, conversation_id, db
+            )
+            if completion_response is not None:
+                return completion_response
+
+        # Identity capture: when a new user greets, ask for name + email (once).
+        # Runs only for normal (non-escalated) conversations.
+        if form_data is None:
+            capture_response = self._maybe_handle_identity_capture(
+                message, session_id, user_id, conversation_id, session_for_id, db, start_time
+            )
+            if capture_response is not None:
+                return capture_response
 
         # If we previously offered to share a section (e.g., benefits) and the user replies "yes",
         # convert that into the corresponding section answer.
@@ -824,16 +935,29 @@ class ConversationalMode:
         if form_data is None:
             no_ret_kind = self._detect_no_retrieval_intent(message)
             if no_ret_kind:
-                # Small-talk/greeting/thanks/goodbye: skip RAG.
-                if self.small_talk_responder is not None:
-                    try:
-                        answer_text = await self.small_talk_responder.respond(message, no_ret_kind)
-                        if _is_incomplete_smalltalk_reply(answer_text):
+                # Before ending a conversation, ask whether everything was answered (once).
+                completion_triggered = False
+                if no_ret_kind == "GOODBYE":
+                    session = self.state_manager.get_session(session_id) or {}
+                    ctx = dict(session.get("context") or {})
+                    if not ctx.get("completion_asked") and not ctx.get("pending_completion_question"):
+                        ctx["completion_asked"] = True
+                        ctx["pending_completion_question"] = True
+                        self.state_manager.update_session(session_id, {"context": ctx})
+                        answer_text = COMPLETION_ASK_PROMPT
+                        completion_triggered = True
+
+                if not completion_triggered:
+                    # Small-talk/greeting/thanks/goodbye: skip RAG.
+                    if self.small_talk_responder is not None:
+                        try:
+                            answer_text = await self.small_talk_responder.respond(message, no_ret_kind)
+                            if _is_incomplete_smalltalk_reply(answer_text):
+                                answer_text = self._build_no_retrieval_reply(no_ret_kind)
+                        except Exception:
                             answer_text = self._build_no_retrieval_reply(no_ret_kind)
-                    except Exception:
+                    else:
                         answer_text = self._build_no_retrieval_reply(no_ret_kind)
-                else:
-                    answer_text = self._build_no_retrieval_reply(no_ret_kind)
 
                 _emit_metrics(
                     db,
@@ -873,7 +997,7 @@ class ConversationalMode:
                     "confidence": 1.0,
                 }
 
-                if no_ret_kind == "GOODBYE":
+                if no_ret_kind == "GOODBYE" and not completion_triggered:
                     self.state_manager.end_session(session_id, ended_by="bot")
 
                 return payload
@@ -1048,6 +1172,7 @@ class ConversationalMode:
             answer_text = processed.get("message")
             follow_up_flag = processed.get("follow_up", False)
             processed_reason = (processed.get("metadata") or {}).get("reason")
+            processed_fallback = bool(processed.get("fallback"))
             if processed.get("fallback"):
                 metrics_to_emit.append(_metric_payload("fallbacks", 1.0, conversation_id))
             if processed.get("offer_human"):
@@ -1059,6 +1184,23 @@ class ConversationalMode:
             answer_text = response["answer"]
             follow_up_flag = False
             processed_reason = None
+            processed_fallback = False
+
+        # Separate "bot is DOWN" (service error) from "bot doesn't have the
+        # answers" (no chunks / no sources / low confidence / fallback reply).
+        if system_error:
+            self._log_service_error(
+                db, conversation_id, message, response.get("error_kind") or "system_error"
+            )
+        elif offer_agent:
+            reason = (
+                "no_chunks"
+                if not retrieval_results
+                else ("no_sources" if not sources else "low_confidence")
+            )
+            self._log_unanswered(db, conversation_id, message, reason=reason)
+        elif processed_fallback:
+            self._log_unanswered(db, conversation_id, message, reason="fallback")
 
         if processed_reason == "incomplete_input" and not products:
             recommendation = await self._build_recommendation_response(message, session_id)
@@ -1387,6 +1529,12 @@ class ConversationalMode:
             ctx["pending_agent_offer"] = True
             self.state_manager.update_session(session_id, {"context": ctx})
             show_handover_button = True
+            self._log_unanswered(
+                db,
+                conversation_id or session_id,
+                message,
+                reason="no_chunks" if not result.sources else "low_confidence",
+            )
 
         payload = {
             "mode": "conversational",
@@ -1775,6 +1923,18 @@ class ConversationalMode:
         start_time: float,
     ) -> Dict[str, Any]:
         """Build the response payload for a NO_RETRIEVAL intent (no RAG)."""
+        # Ask the completion question once per conversation before ending.
+        completion_triggered = False
+        if kind == "GOODBYE":
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            if not ctx.get("completion_asked") and not ctx.get("pending_completion_question"):
+                ctx["completion_asked"] = True
+                ctx["pending_completion_question"] = True
+                self.state_manager.update_session(session_id, {"context": ctx})
+                answer_text = COMPLETION_ASK_PROMPT
+                completion_triggered = True
+
         _emit_metrics(
             db,
             [_metric_payload("response_latency", time.time() - start_time, conversation_id)],
@@ -1807,10 +1967,232 @@ class ConversationalMode:
             "confidence": 1.0,
         }
 
-        if str(kind).upper() == "GOODBYE":
+        if str(kind).upper() == "GOODBYE" and not completion_triggered:
             self.state_manager.end_session(session_id, ended_by="bot")
 
         return payload
+
+    def _identity_response(self, text: str, intent: str) -> Dict[str, Any]:
+        return {
+            "mode": "conversational",
+            "response": text,
+            "sources": [],
+            "products_matched": [],
+            "intent": intent,
+            "intent_type": "NO_RETRIEVAL",
+            "confidence": 1.0,
+        }
+
+    def _emit_intent_event(self, db, conversation_id: Optional[str], intent: str, intent_type: str, message: str, start_time: float) -> None:
+        if db is None or not hasattr(db, "add_conversation_event"):
+            return
+        try:
+            db.add_conversation_event(
+                conversation_id=conversation_id,
+                event_type="intent",
+                payload={
+                    "intent": intent,
+                    "intent_type": intent_type,
+                    "confidence": 1.0,
+                    "user_message": message,
+                    "response_latency": time.time() - start_time,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[metrics] Failed to record conversation event: %s", exc)
+
+    def _log_unanswered(self, db, conversation_id: Optional[str], message: str, reason: str) -> None:
+        """Record a question the bot could NOT answer (no chunks / low confidence)."""
+        if db is not None and hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id,
+                    event_type="unanswered_question",
+                    payload={
+                        "question": (message or "").strip()[:500],
+                        "reason": reason,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[metrics] Failed to record unanswered event: %s", exc)
+        _emit_metrics(db, [_metric_payload("unanswered_questions", 1.0, conversation_id)])
+
+    def _log_service_error(self, db, conversation_id: Optional[str], message: str, error_kind: str) -> None:
+        """Record a bot-DOWN event: the bot could not reply due to a service failure."""
+        if db is not None and hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id,
+                    event_type="service_error",
+                    payload={
+                        "question": (message or "").strip()[:500],
+                        "error_kind": error_kind,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[metrics] Failed to record service error event: %s", exc)
+        _emit_metrics(db, [_metric_payload("service_errors", 1.0, conversation_id)])
+
+    def _record_completion(self, db, conversation_id: Optional[str], message: str, outcome: str) -> None:
+        """Record the user's completion answer, labelling the conversation outcome."""
+        if db is not None and hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id,
+                    event_type="completion_confirmed",
+                    payload={
+                        "outcome": outcome,
+                        "user_message": (message or "").strip()[:500],
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[metrics] Failed to record completion event: %s", exc)
+        resolved_value = 1.0 if outcome == "resolved" else 0.0
+        _emit_metrics(db, [_metric_payload("completion_outcome", resolved_value, conversation_id)])
+
+    def _maybe_handle_completion_question(
+        self,
+        message: str,
+        session_id: str,
+        conversation_id: Optional[str],
+        db,
+    ) -> Optional[Dict[str, Any]]:
+        """Interpret the user's reply to the completion question ("did I answer everything?")."""
+        if not message or not (message or "").strip():
+            return None
+
+        if db is None:
+            db = getattr(self.state_manager, "db", None)
+
+        session = self.state_manager.get_session(session_id) or {}
+        ctx = dict(session.get("context") or {})
+        if not ctx.get("pending_completion_question"):
+            return None
+
+        ctx.pop("pending_completion_question", None)
+
+        if _is_affirmative(message):
+            self.state_manager.update_session(session_id, {"context": ctx})
+            self._record_completion(db, conversation_id, message, "resolved")
+            try:
+                self.state_manager.end_session(session_id, ended_by="bot")
+            except Exception:
+                pass
+            return {
+                "mode": "conversational",
+                "response": COMPLETION_RESOLVED_PROMPT,
+                "confidence": 1.0,
+                "outcome": "resolved",
+            }
+
+        if _is_negative(message):
+            sess = self.state_manager.get_session(session_id) or {}
+            pending_ctx = dict(sess.get("context") or {})
+            pending_ctx["pending_agent_offer"] = True
+            self.state_manager.update_session(session_id, {"context": pending_ctx})
+            self._record_completion(db, conversation_id, message, "unresolved")
+            return {
+                "mode": "conversational",
+                "response": COMPLETION_UNRESOLVED_PROMPT,
+                "confidence": 1.0,
+                "outcome": "unresolved",
+                "show_handover_button": True,
+            }
+
+        # Any other reply: the user kept chatting - clear the question and continue.
+        self.state_manager.update_session(session_id, {"context": ctx})
+        return None
+
+    def _save_identity(self, db, user_id: str, name: Optional[str], email: Optional[str], conversation_id: Optional[str], via: str, partial: bool = False) -> None:
+        if db is not None and hasattr(db, "set_user_identity"):
+            try:
+                db.set_user_identity(user_id, name=name, email=email)
+            except Exception as exc:
+                logger.warning("[identity] failed to persist identity: %s", exc)
+        if db is not None and hasattr(db, "add_conversation_event"):
+            try:
+                db.add_conversation_event(
+                    conversation_id=conversation_id,
+                    event_type="identity_captured",
+                    payload={
+                        "name_masked": CLIENT_NAME_MASK,
+                        "has_name": bool(name),
+                        "email": email,
+                        "via": via,
+                        "partial": bool(partial),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[identity] failed to record identity event: %s", exc)
+
+    def _maybe_handle_identity_capture(self, message: str, session_id: str, user_id: str, conversation_id: Optional[str], session: Dict[str, Any], db, start_time: float) -> Optional[Dict[str, Any]]:
+        """Greeting flow: ask for the user's name + email once per user (privacy-safe).
+
+        Returns a response payload when this turn is consumed by identity
+        capture, otherwise None so normal processing continues. The client's
+        name is masked (:clients_name); the email is stored for follow-up.
+        """
+        try:
+            if not message or not (message or "").strip():
+                return None
+
+            if db is None:
+                db = getattr(self.state_manager, "db", None)
+
+            ctx = dict(session.get("context") or {})
+            pending = bool(ctx.get("pending_identity_capture"))
+
+            if not pending:
+                if not _is_greeting(message):
+                    return None
+                user = None
+                if db is not None and hasattr(db, "get_user_by_id"):
+                    try:
+                        user = db.get_user_by_id(user_id)
+                    except Exception:
+                        user = None
+                if user is not None and (getattr(user, "email", None) or "").strip():
+                    return None  # identity already captured -> normal greeting flow
+                ctx["pending_identity_capture"] = True
+                self.state_manager.update_session(session_id, {"context": ctx})
+                _emit_metrics(
+                    db,
+                    [_metric_payload("response_latency", time.time() - start_time, conversation_id)],
+                )
+                self._emit_intent_event(db, conversation_id, "greeting", "NO_RETRIEVAL", message, start_time)
+                return self._identity_response(IDENTITY_ASK_PROMPT, "greeting")
+
+            # Pending capture: this turn should contain the identity info.
+            if _is_greeting(message):
+                return self._identity_response(IDENTITY_ASK_PROMPT, "greeting")
+
+            email = _extract_email(message)
+            name = _extract_name(message, email)
+
+            if email:
+                self._save_identity(db, user_id, name, email, conversation_id, via="greeting")
+                ctx.pop("pending_identity_capture", None)
+                self.state_manager.update_session(session_id, {"context": ctx})
+                return self._identity_response(IDENTITY_CONFIRMED_PROMPT, "identity_captured")
+
+            if _looks_like_question(message):
+                # Not identity info — stop waiting and process normally.
+                ctx.pop("pending_identity_capture", None)
+                self.state_manager.update_session(session_id, {"context": ctx})
+                return None
+
+            if name:
+                # Partial: store the name, keep waiting for the email.
+                self._save_identity(db, user_id, name, None, conversation_id, via="greeting", partial=True)
+                return self._identity_response(IDENTITY_ASK_EMAIL_PROMPT, "identity_partial")
+
+            # Unrecognized short reply: don't block the conversation.
+            ctx.pop("pending_identity_capture", None)
+            self.state_manager.update_session(session_id, {"context": ctx})
+            return None
+        except Exception as exc:
+            logger.warning("[identity] identity capture failed, continuing normally: %s", exc)
+            return None
 
     def _get_recent_history(self, session_id: str, limit: int = 10) -> List[Dict]:
         """Get recent conversation history.

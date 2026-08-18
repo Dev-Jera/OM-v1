@@ -94,6 +94,19 @@ class ChatRouter:
                     reason="customer_requested_agent",
                     user_id=user_id,
                 )
+                conversation_id = session.get("conversation_id")
+                db_ref = db if db is not None else getattr(self.state_manager, "db", None)
+                if db_ref is not None and hasattr(db_ref, "add_conversation_event"):
+                    try:
+                        db_ref.add_conversation_event(
+                            conversation_id=conversation_id,
+                            event_type="escalation_confirmed",
+                            payload={"source": "button", "reason": "customer_requested_agent"},
+                        )
+                        from src.chatbot.paths import record_conversation_path
+                        record_conversation_path(db_ref, conversation_id, "direct_agent", "button")
+                    except Exception:
+                        pass
                 return {
                     "mode": "escalated",
                     "response": {

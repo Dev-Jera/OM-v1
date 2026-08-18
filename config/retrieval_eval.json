@@ -1,0 +1,42 @@
+[
+  {
+    "question": "What does Serenicare cover for individuals and small companies?",
+    "doc_id": "website:product:personal/insure/serenicare"
+  },
+  {
+    "question": "What are the age limits for the Family Life Protect cover?",
+    "doc_id": "website:product:personal/insure/family-life-protection"
+  },
+  {
+    "question": "Our company has 40 staff members, which group medical plan fits us?",
+    "doc_id": "website:product:business/general/group-medical-standard"
+  },
+  {
+    "question": "We are a small company with 20 staff, which medical cover should we take?",
+    "doc_id": "website:product:business/general/sme-medical-cover"
+  },
+  {
+    "question": "An employee stole money from our company, what insurance covers us?",
+    "doc_id": "website:product:business/general/fidelity-guarantee"
+  },
+  {
+    "question": "Can I insure my dairy cattle and poultry against theft and disease?",
+    "doc_id": "website:product:business/general/livestock"
+  },
+  {
+    "question": "Is my maize crop covered against drought and floods?",
+    "doc_id": "website:product:business/general/crop-insurance"
+  },
+  {
+    "question": "I want a plan that gives a tax-free lump sum after saving for 5 to 10 years, which one?",
+    "doc_id": "website:product:personal/save-and-invest/sure-deal-savings-plan"
+  },
+  {
+    "question": "I want to save for my child's school fees, which plan should I use?",
+    "doc_id": "website:product:personal/save-and-invest/somesa-education-plan"
+  },
+  {
+    "question": "We are a transport company carrying client goods and want protection against our own negligence causing loss of those goods while in transit, which policy is that?",
+    "doc_id": "website:product:business/general/carriers-liability"
+  }
+]
