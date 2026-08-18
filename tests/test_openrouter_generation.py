@@ -27,7 +27,7 @@ def _patch_requests_session(monkeypatch, responses):
             captured["calls"].append({"url": url, **kwargs})
             return responses.pop(0)
 
-    monkeypatch.setattr("src.rag.generate.requests.Session", lambda: _FakeSession())
+    monkeypatch.setattr("src.utils.llm_provider.requests.Session", lambda: _FakeSession())
     return captured
 
 

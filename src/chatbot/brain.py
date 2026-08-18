@@ -24,6 +24,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.utils.llm_provider import (
+    is_openrouter_enabled,
+    openrouter_api_key,
+    openrouter_base_url,
+    openrouter_model,
+    openrouter_session,
+    post_chat_completion,
+)
 from src.utils.pii_redaction import clean_history, redact_history, redact_text
 from src.utils.response_safety import looks_truncated, merge_continuation, strip_meta_lead_in
 
@@ -253,6 +261,37 @@ def _build_contents(history: List[Dict[str, Any]], message: str) -> List[Dict[st
     return _coalesce(parts)
 
 
+def _build_openai_messages(history: List[Dict[str, Any]], message: str) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    for msg in (history or [])[-8:]:
+        role = (msg.get("role") or "").strip().lower()
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        role_key = "assistant" if role == "assistant" else "user"
+        messages.append({"role": role_key, "content": content[:1200]})
+    messages.append({"role": "user", "content": message[:2000]})
+    return messages
+
+
+def _openai_tools() -> List[Dict[str, Any]]:
+    """Convert the Gemini function-declaration list into OpenAI tool definitions."""
+    tools: List[Dict[str, Any]] = []
+    for block in _TOOLS:
+        for fd in block.get("function_declarations") or []:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": fd["name"],
+                        "description": fd.get("description", ""),
+                        "parameters": fd.get("parameters", {"type": "object"}),
+                    },
+                }
+            )
+    return tools
+
+
 def _hits_to_results(hits: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not hits:
         return {"results": []}
@@ -297,14 +336,28 @@ class ConversationalBrain:
         self.enabled = _env_bool("CONVERSATIONAL_BRAIN_ENABLED") if enabled is None else enabled
 
         self.client = None
+        self.provider = "gemini"
+        self._or_http = None
+        self._or_base_url = ""
+        self._or_api_key = ""
+        self._or_model = ""
         if self.llm is None:
             try:
-                from google import genai
+                if is_openrouter_enabled():
+                    if not openrouter_api_key():
+                        raise RuntimeError("OPENROUTER_API_KEY is missing; ConversationalBrain disabled.")
+                    self.provider = "openrouter"
+                    self._or_http = openrouter_session()
+                    self._or_base_url = openrouter_base_url()
+                    self._or_api_key = openrouter_api_key()
+                    self._or_model = openrouter_model()
+                else:
+                    from google import genai
 
-                api_key = os.environ.get(api_key_env)
-                if not api_key:
-                    raise RuntimeError(f"{api_key_env} is missing; ConversationalBrain disabled.")
-                self.client = genai.Client(api_key=api_key)
+                    api_key = os.environ.get(api_key_env)
+                    if not api_key:
+                        raise RuntimeError(f"{api_key_env} is missing; ConversationalBrain disabled.")
+                    self.client = genai.Client(api_key=api_key)
             except Exception as exc:  # pragma: no cover - depends on env
                 logger.warning("ConversationalBrain unavailable: %s", exc)
                 self.enabled = False
@@ -387,6 +440,9 @@ class ConversationalBrain:
         """Run one conversation turn with the brain. Returns None if unusable."""
         if not self.enabled:
             return None
+
+        if self.provider == "openrouter":
+            return await self._converse_openrouter(message, history, pending_quote_offer)
 
         masked_message, _ = redact_text(message)
         if not masked_message.strip():
@@ -500,6 +556,9 @@ class ConversationalBrain:
         if not self.enabled:
             return "other"
 
+        if self.provider == "openrouter":
+            return await self._confirm_quote_openrouter(message, history)
+
         masked_message, _ = redact_text(message)
         clean = clean_history(history or [])
         masked_history = redact_history(clean)
@@ -509,6 +568,147 @@ class ConversationalBrain:
         try:
             response = await self._call_llm(contents, config)
             text = _response_text(response)
+            if not text:
+                return "other"
+            parsed = json.loads(text)
+            decision = str(parsed.get("decision") or "").strip().lower()
+            return decision if decision in ("proceed", "cancel", "other") else "other"
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("confirm_quote_offer failed, defaulting to 'other': %s", exc)
+            return "other"
+
+    # -- OpenRouter path --------------------------------------------------------
+
+    async def _call_openrouter(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        system: str,
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> dict:
+        def _sync() -> dict:
+            return post_chat_completion(
+                session=self._or_http,
+                base_url=self._or_base_url,
+                api_key=self._or_api_key,
+                model=self._or_model,
+                messages=[{"role": "system", "content": system}] + messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+            )
+
+        return await asyncio.to_thread(_sync)
+
+    async def _converse_openrouter(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+        pending_quote_offer: bool = False,
+    ) -> Optional[ConversationResult]:
+        """OpenAI-format tool loop (used when LLM_PROVIDER=openrouter)."""
+        masked_message, _ = redact_text(message)
+        if not masked_message.strip():
+            return None
+
+        clean = clean_history(history or [])
+        masked_history = redact_history(clean)
+        messages = _build_openai_messages(masked_history, masked_message)
+
+        system = SYSTEM_INSTRUCTION
+        if pending_quote_offer:
+            system += (
+                "\n\nThe user is responding to your quotation offer. Decide if they want to "
+                "proceed, then reply accordingly."
+            )
+        tools = _openai_tools()
+
+        used_knowledge = False
+        sources: List[Dict[str, Any]] = []
+        quote_requested = False
+        product: Optional[str] = None
+
+        try:
+            for _round in range(self.max_tool_rounds + 1):
+                response = await self._call_openrouter(
+                    messages=messages,
+                    system=system,
+                    temperature=0.3,
+                    max_tokens=1200,
+                    tools=tools,
+                )
+                choice = (response.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                text = str(msg.get("content") or "").strip()
+                tool_calls = msg.get("tool_calls") or []
+
+                if not tool_calls:
+                    if not text:
+                        logger.warning("Brain returned empty reply")
+                        return None
+                    text = strip_meta_lead_in(text)
+                    if not text:
+                        logger.warning("Brain returned empty reply after safety checks")
+                        return None
+                    return ConversationResult(
+                        reply=text,
+                        used_knowledge=used_knowledge,
+                        sources=sources,
+                        quote_requested=quote_requested,
+                        product=product,
+                    )
+
+                messages.append(
+                    {"role": "assistant", "content": text or None, "tool_calls": tool_calls}
+                )
+                for call in tool_calls:
+                    name = str((call.get("function") or {}).get("name") or "")
+                    try:
+                        args = json.loads(str((call.get("function") or {}).get("arguments") or "{}"))
+                    except Exception:
+                        args = {}
+                    call_id = str(call.get("id") or "")
+                    if name == "search_knowledge_base":
+                        query = str(args.get("query") or "").strip() or masked_message
+                        hits = await self._retrieve(query)
+                        used_knowledge = True
+                        sources.extend(hits)
+                        result = _hits_to_results(hits)
+                    elif name == "request_guided_quote":
+                        quote_requested = True
+                        detected = str(args.get("product") or "").strip()
+                        product = detected if detected in PRODUCT_FLOWS else None
+                        result = {"ok": True, "loaded": True}
+                    else:
+                        result = {"error": "unknown tool"}
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)}
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("ConversationalBrain.converse failed: %s", exc, exc_info=True)
+            return None
+
+        return None
+
+    async def _confirm_quote_openrouter(
+        self, message: str, history: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        masked_message, _ = redact_text(message)
+        clean = clean_history(history or [])
+        masked_history = redact_history(clean)
+        messages = _build_openai_messages(masked_history, masked_message)
+        try:
+            response = await self._call_openrouter(
+                messages=messages,
+                system=QUOTE_CONFIRM_INSTRUCTION,
+                temperature=0.0,
+                max_tokens=40,
+                tools=None,
+            )
+            choice = (response.get("choices") or [{}])[0]
+            text = str((choice.get("message") or {}).get("content") or "").strip()
             if not text:
                 return "other"
             parsed = json.loads(text)

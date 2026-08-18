@@ -2,9 +2,14 @@ import os
 import logging
 import asyncio
 import random
-import requests
 from typing import Any, Dict, List, Tuple
 
+from src.utils.llm_provider import (
+    openrouter_api_key,
+    openrouter_base_url,
+    openrouter_model,
+    openrouter_session,
+)
 from src.utils.response_safety import (
     looks_truncated,
     merge_continuation,
@@ -24,9 +29,6 @@ MODEL_NAME = os.getenv("MIA_MODEL", "gemini-3.6-flash")
 # (OpenAI-compatible pay-per-use gateway - no hard daily quota).
 # Read fresh inside MiaGenerator.__init__ so runtime env changes take effect.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Reserved last-resort replies. The "can't answer" message is only used when no
 # LLM is available at all (generation disabled/failed hard); normally the LLM
@@ -132,18 +134,15 @@ class MiaGenerator:
     ):
         self.provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
         if self.provider == "openrouter":
-            if not os.environ.get("OPENROUTER_API_KEY"):
+            if not openrouter_api_key():
                 raise RuntimeError("CRITICAL: OPENROUTER_API_KEY is missing.")
-            self.openrouter_api_key = os.environ["OPENROUTER_API_KEY"]
-            self.openrouter_base_url = os.getenv(
-                "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-            ).rstrip("/")
-            self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+            self.openrouter_api_key = openrouter_api_key()
+            self.openrouter_base_url = openrouter_base_url()
+            self.openrouter_model = openrouter_model()
             self.openrouter_timeout = 180
             # Ignore HTTP(S)_PROXY/ALL_PROXY env vars (e.g. PaaS-hosted services)
             # so the OpenRouter call always goes direct.
-            self._http = requests.Session()
-            self._http.trust_env = False
+            self._http = openrouter_session()
         else:
             from google import genai
             api_key = os.environ.get("GEMINI_API_KEY")

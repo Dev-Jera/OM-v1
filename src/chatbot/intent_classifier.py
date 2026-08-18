@@ -3,10 +3,20 @@ import json
 import logging
 import os
 import re
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 from google import genai
 from google.genai import types
+
+from src.utils.llm_provider import (
+    is_openrouter_enabled,
+    openrouter_api_key,
+    openrouter_base_url,
+    openrouter_model,
+    openrouter_session,
+    post_chat_completion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +57,24 @@ class SmallTalkResponder:
     """
 
     def __init__(self, api_key_env: str = "GEMINI_API_KEY"):
-        api_key = os.environ.get(api_key_env)
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is missing; SmallTalkResponder cannot be used.")
-        self.client = genai.Client(api_key=api_key)
+        self.provider = "gemini"
+        self._or_http = None
+        self._or_base_url = ""
+        self._or_api_key = ""
+        self._or_model = ""
+        if is_openrouter_enabled():
+            if not openrouter_api_key():
+                raise RuntimeError("OPENROUTER_API_KEY is missing; SmallTalkResponder cannot be used.")
+            self.provider = "openrouter"
+            self._or_http = openrouter_session()
+            self._or_base_url = openrouter_base_url()
+            self._or_api_key = openrouter_api_key()
+            self._or_model = openrouter_model()
+        else:
+            api_key = os.environ.get(api_key_env)
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY is missing; SmallTalkResponder cannot be used.")
+            self.client = genai.Client(api_key=api_key)
 
     async def respond(self, message: str, label: str) -> str:
         msg = (message or "").strip()
@@ -73,6 +97,24 @@ Rules:
         try:
             # Use asyncio.to_thread to avoid blocking the event loop
             def _sync_generate():
+                if self.provider == "openrouter":
+                    result = post_chat_completion(
+                        session=self._or_http,
+                        base_url=self._or_base_url,
+                        api_key=self._or_api_key,
+                        model=self._or_model,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=120,
+                    )
+                    choices = result.get("choices") or []
+                    content = ""
+                    if choices:
+                        content = (choices[0].get("message") or {}).get("content") or ""
+                    return SimpleNamespace(text=content)
                 response = self.client.models.generate_content(
                     model=INTENT_MODEL_NAME,
                     contents=prompt,
@@ -121,19 +163,34 @@ class IntentRouter:
 
     def __init__(self, api_key_env: str = "GEMINI_API_KEY", client=None, model: Optional[str] = None):
         self.client = client
+        self.provider = "gemini"
+        self._or_http = None
+        self._or_base_url = ""
+        self._or_api_key = ""
         if self.client is None:
             try:
-                api_key = os.environ.get(api_key_env)
-                if not api_key:
-                    raise RuntimeError(f"{api_key_env} is missing; IntentRouter disabled.")
-                self.client = genai.Client(api_key=api_key)
+                if is_openrouter_enabled():
+                    if not openrouter_api_key():
+                        raise RuntimeError("OPENROUTER_API_KEY is missing; IntentRouter disabled.")
+                    self.provider = "openrouter"
+                    self._or_http = openrouter_session()
+                    self._or_base_url = openrouter_base_url()
+                    self._or_api_key = openrouter_api_key()
+                else:
+                    api_key = os.environ.get(api_key_env)
+                    if not api_key:
+                        raise RuntimeError(f"{api_key_env} is missing; IntentRouter disabled.")
+                    self.client = genai.Client(api_key=api_key)
             except Exception as exc:  # pragma: no cover - depends on env
                 logger.warning("IntentRouter unavailable: %s", exc)
                 self.client = None
-        self.model = model or INTENT_MODEL_NAME
+        self.model = openrouter_model() if self.provider == "openrouter" else (model or INTENT_MODEL_NAME)
 
     async def route(self, message: str) -> Tuple[str, Optional[str]]:
-        if self.client is None:
+        if self.provider == "openrouter":
+            if not self._or_api_key:
+                return ("UNKNOWN", None)
+        elif self.client is None:
             return ("UNKNOWN", None)
         return await self._llm_route((message or "").strip())
 
@@ -148,6 +205,24 @@ class IntentRouter:
             return ("UNKNOWN", None)
 
     def _sync_generate(self, system_instruction: str, prompt: str):
+        if self.provider == "openrouter":
+            result = post_chat_completion(
+                session=self._or_http,
+                base_url=self._or_base_url,
+                api_key=self._or_api_key,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=200,
+            )
+            choices = result.get("choices") or []
+            content = ""
+            if choices:
+                content = (choices[0].get("message") or {}).get("content") or ""
+            return SimpleNamespace(text=content)
         return self.client.models.generate_content(
             model=self.model,
             contents=prompt,
