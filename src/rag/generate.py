@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import random
+import requests
 from typing import Any, Dict, List, Tuple
 
 from src.utils.response_safety import (
@@ -133,13 +134,12 @@ class MiaGenerator:
         if self.provider == "openrouter":
             if not os.environ.get("OPENROUTER_API_KEY"):
                 raise RuntimeError("CRITICAL: OPENROUTER_API_KEY is missing.")
-            import openai as _openai_sdk
-
-            self.client = _openai_sdk.OpenAI(
-                api_key=os.environ["OPENROUTER_API_KEY"],
-                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            )
+            self.openrouter_api_key = os.environ["OPENROUTER_API_KEY"]
+            self.openrouter_base_url = os.getenv(
+                "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+            ).rstrip("/")
             self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+            self.openrouter_timeout = 180
         else:
             from google import genai
             api_key = os.environ.get("GEMINI_API_KEY")
@@ -294,13 +294,12 @@ class MiaGenerator:
         if self.provider == "openrouter":
             text = ""
             finish_reason = None
-            choices = getattr(response, "choices", None) or []
+            choices = (response or {}).get("choices") or []
             if choices:
                 first = choices[0]
-                message = getattr(first, "message", None)
-                content = getattr(message, "content", None) if message is not None else None
-                text = (content or "").strip()
-                finish_reason = getattr(first, "finish_reason", None)
+                message = first.get("message") or {}
+                text = str(message.get("content") or "").strip()
+                finish_reason = first.get("finish_reason")
             return text, finish_reason
 
         text = (getattr(response, "text", "") or "").strip()
@@ -363,15 +362,28 @@ class MiaGenerator:
 
         def _sync_generate(prompt: str, max_output_tokens: int = 1200):
             if self.provider == "openrouter":
-                return self.client.chat.completions.create(
-                    model=self.openrouter_model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_INSTRUCTION},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=max_output_tokens,
+                http_response = requests.post(
+                    f"{self.openrouter_base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.openrouter_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.openrouter_model,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_INSTRUCTION},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": self.temperature,
+                        "max_tokens": max_output_tokens,
+                    },
+                    timeout=self.openrouter_timeout,
                 )
+                if http_response.status_code != 200:
+                    raise RuntimeError(
+                        f"OpenRouter HTTP {http_response.status_code}: {http_response.text[:300]}"
+                    )
+                return http_response.json()
 
             from google.genai import types
             response = self.client.models.generate_content(
