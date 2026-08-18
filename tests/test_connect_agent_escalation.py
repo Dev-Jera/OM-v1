@@ -91,3 +91,29 @@ async def test_duplicate_escalation_events_dedupe_by_conversation():
         if e.conversation_id
     }
     assert len(distinct) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_escalate_endpoint_emits_escalation_confirmed():
+    """/escalate must emit escalation_confirmed so direct escalations count in
+    the outcome model just like chat-flow escalations."""
+    import src.api.escalation as escalation_module
+    from src.api.escalation import EscalateRequest, escalate
+
+    db = PostgresDB()
+    redis = RedisCache()
+    sm = StateManager(redis, db)
+    escalation_module.state_manager = sm
+
+    user = db.get_or_create_user("256700000444")
+    session_id = sm.create_session(str(user.id))
+    conversation_id = sm.get_session(session_id)["conversation_id"]
+
+    result = await escalate(EscalateRequest(session_id=session_id, reason="customer_requested_agent"))
+
+    assert result["success"] is True
+    assert sm.get_escalation_state(session_id).get("escalated") is True
+    events = _events(db, "escalation_confirmed")
+    assert len(events) == 1
+    assert events[0].conversation_id == conversation_id
+    assert events[0].payload["reason"] == "customer_requested_agent"

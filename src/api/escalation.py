@@ -41,6 +41,19 @@ async def escalate(body: EscalateRequest):
         )
     except Exception:
         pass
+    # Emit the same escalation_confirmed event the outcome model keys on, so
+    # direct escalations show up in resolution/impact metrics like chat-flow
+    # escalations do.
+    try:
+        db = getattr(state_manager, "db", None)
+        if db is not None and hasattr(db, "add_conversation_event"):
+            db.add_conversation_event(
+                conversation_id=conversation_id,
+                event_type="escalation_confirmed",
+                payload={"source": "user", "reason": body.reason or "customer_requested_agent"},
+            )
+    except Exception:
+        pass
     return {"success": True, "escalated": True, "state": state}
 
 

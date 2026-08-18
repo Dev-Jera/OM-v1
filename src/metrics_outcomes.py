@@ -35,6 +35,21 @@ _PRIORITY = [
 ]
 
 
+def _coerce_outcome(raw: Any) -> float:
+    """Accept both numeric (1.0/0.0, as the seeder writes) and worded
+    ("resolved"/"unresolved", as the chat completion path writes) outcomes."""
+    if isinstance(raw, bool):
+        return 1.0 if raw else 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    text = str(raw or "").strip().lower()
+    if text in {"resolved", "yes", "true", "y", "1"}:
+        return 1.0
+    return 0.0
+
+
 def _event_outcome(ev: Any) -> Optional[str]:
     event_type = str(getattr(ev, "event_type", ""))
     if event_type == "service_error":
@@ -43,10 +58,7 @@ def _event_outcome(ev: Any) -> Optional[str]:
         return OUTCOME_ESCALATED
     if event_type == "completion_confirmed":
         payload = getattr(ev, "payload", {}) or {}
-        try:
-            outcome = float(payload.get("outcome", 0.0))
-        except (TypeError, ValueError):
-            outcome = 0.0
+        outcome = _coerce_outcome(payload.get("outcome", 0.0))
         return OUTCOME_RESOLVED if outcome >= 0.5 else OUTCOME_UNRESOLVED
     if event_type == "unanswered_question":
         return OUTCOME_UNRESOLVED

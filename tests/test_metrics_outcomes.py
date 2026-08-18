@@ -122,6 +122,44 @@ async def test_impact_uses_same_numbers_as_shared_model():
 
 
 @pytest.mark.asyncio
+async def test_outcomes_accept_worded_completion_outcomes():
+    """The chat completion path writes "resolved"/"unresolved" strings; the
+    outcome model must not silently treat those as unresolved."""
+    db = PostgresDB()
+    now = datetime.utcnow()
+    start = now - timedelta(hours=3)
+
+    c1 = _seed_conversation(db, start)
+    _event(db, c1, "completion_confirmed", start + timedelta(minutes=1), {"outcome": "resolved"})
+    c2 = _seed_conversation(db, start)
+    _event(db, c2, "completion_confirmed", start + timedelta(minutes=1), {"outcome": "unresolved"})
+
+    outcomes = compute_conversation_outcomes(db, start, now)
+
+    assert outcomes["detail"][c1] == "resolved"
+    assert outcomes["detail"][c2] == "unresolved"
+    assert outcomes["resolved"] == 1
+    assert outcomes["unresolved"] == 1
+
+
+@pytest.mark.asyncio
+async def test_outcomes_accept_mixed_numeric_and_worded():
+    db = PostgresDB()
+    now = datetime.utcnow()
+    start = now - timedelta(hours=3)
+
+    # Numeric (seeder) and worded (chat path) resolved signals both count.
+    c1 = _seed_conversation(db, start)
+    _event(db, c1, "completion_confirmed", start + timedelta(minutes=1), {"outcome": 1.0})
+    c2 = _seed_conversation(db, start)
+    _event(db, c2, "completion_confirmed", start + timedelta(minutes=1), {"outcome": "resolved"})
+
+    outcomes = compute_conversation_outcomes(db, start, now)
+    assert outcomes["resolved"] == 2
+    assert outcomes["unresolved"] == 0
+
+
+@pytest.mark.asyncio
 async def test_orphan_csat_rating_is_excluded():
     db = PostgresDB()
     now = datetime.utcnow()
