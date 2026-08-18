@@ -37,13 +37,15 @@ class FallbackHandler:
     ) -> Dict[str, Any]:
         logger.info("Generating fallback: reason=%s, confidence=%s", reason, confidence)
 
-        # Low confidence: offer human help (wait for user confirmation before escalating).
+        # Low confidence: ask a gentle clarifying question. We do NOT offer a
+        # human agent here - the agent is only offered when the user asks for
+        # one or declines the completion question.
         if reason == "low_confidence" or (confidence is not None and confidence < self.offer_human_threshold):
             message = (
-                "I may not have enough information to answer that. Have I replied to all your questions, "
-                "or would you like to talk to an agent?"
+                "I'm sorry, I didn't quite catch that. Could you rephrase or give me a "
+                "little more detail so I can help you better?"
             )
-            offer_human = True
+            offer_human = False
         else:
             message = (
                 "I didn't fully understand. Could you please rephrase or provide more details?"

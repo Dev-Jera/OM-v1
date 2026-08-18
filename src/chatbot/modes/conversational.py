@@ -284,6 +284,38 @@ def _is_negative(message: str) -> bool:
     return m in {"no", "n", "nope", "not now", "later", "maybe later"}
 
 
+# Explicit user request to talk to a human agent (spec condition "user asks").
+# Deliberately narrow so ordinary chat never trips it: the user must actually
+# ask to speak/connect with an agent/representative/human.
+_AGENT_REQUEST_RE = re.compile(
+    r"(?:"
+    r"\b(talk|speak|chat|see|reach|contact)\b[^.!?\n]{0,40}\b(agent|representative|advisor|human)\b"
+    r"|"
+    r"\b(connect|transfer|put|get)\b[^.!?\n]{0,20}\b(agent|representative|advisor|human|person)\b"
+    r"|"
+    r"\b(human|live|real|actual)\s+(agent|representative|advisor)\b"
+    r"|"
+    r"\b(i want|i need|i would like|i'd like|i wish|please)\b[^.!?\n]{0,30}\b(agent|representative|advisor)\b"
+    r"|"
+    r"\b(speak|talk)\s+to\s+(someone|a human)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_agent_request(message: str) -> bool:
+    """True when the user explicitly asks to be connected to a human agent."""
+    m = (message or "").strip().lower()
+    if not m:
+        return False
+    # Refusals / complaints about agents must never escalate.
+    if re.search(r"\b(don'?t|do not|won'?t|will not|can'?t|cannot|not)\s+(want|need|wish|like)\b", m):
+        return False
+    if re.search(r"\b(no need|no thanks|never|stop)\b", m):
+        return False
+    return bool(_AGENT_REQUEST_RE.search(m))
+
+
 def _is_explicit_guided_intent(message: str) -> bool:
     m = (message or "").strip().lower()
     if not m:
@@ -774,6 +806,45 @@ class ConversationalMode:
                 pending_ctx.pop("pending_agent_offer", None)
                 self.state_manager.update_session(session_id, {"context": pending_ctx})
 
+        # Explicit request to talk to a human agent: escalate directly. The user
+        # asked for it, so no further confirmation is needed.
+        if form_data is None and _is_agent_request(message):
+            try:
+                from src.integrations.policy.escalation_service import EscalationService
+
+                EscalationService(state_manager=self.state_manager).escalate_to_human(
+                    session_id=session_id,
+                    reason="user_requested_agent",
+                    user_id=user_id,
+                    metadata={"conversation_id": conversation_id},
+                )
+            except Exception:
+                self.state_manager.mark_escalated(
+                    session_id,
+                    reason="user_requested_agent",
+                    metadata={"conversation_id": conversation_id},
+                )
+            if conversation_id and hasattr(self.state_manager.db, "add_conversation_event"):
+                try:
+                    self.state_manager.db.add_conversation_event(
+                        conversation_id=conversation_id,
+                        event_type="escalation_confirmed",
+                        payload={"source": "user", "reason": "user_requested_agent"},
+                    )
+                    from src.chatbot.paths import record_conversation_path
+
+                    record_conversation_path(
+                        self.state_manager.db, conversation_id, "direct_agent", "keyword"
+                    )
+                except Exception:
+                    pass
+            return {
+                "mode": "escalated",
+                "response": "Message sent to human agent.",
+                "escalated": True,
+                "agent_id": None,
+            }
+
         escalation_state = self.state_manager.get_escalation_state(session_id)
         if escalation_state.get("escalated"):
             logger.info(f"Routing message to human agent for session {session_id}")
@@ -1135,37 +1206,23 @@ class ConversationalMode:
         # case: the user just gets the retry message, with no handoff offer.
         system_error = bool(response.get("error"))
 
-        # If confidence is very low, suggest handover button.
+        # MIA's job is to answer the question. We do NOT auto-arm a human-agent
+        # handoff on low confidence or missing chunks - that made MIA push the
+        # agent on customers who were perfectly fine. The agent is only offered
+        # when the user explicitly asks for one or declines the completion
+        # question (handled elsewhere).
         show_handover_button = False
-        if confidence < 0.2 and not system_error:
-            show_handover_button = True
-
-        # No relevant chunks -> the LLM (or the last-resort extractive reply)
-        # already phrased the can't-answer + agent offer. Arm the existing
-        # pending_agent_offer handoff so a "yes" escalates to a human agent.
-        offer_agent = not system_error and (
-            bool(response.get("offer_human")) or (
-                not retrieval_results and confidence < 0.35
-            )
-        )
-        if offer_agent:
-            sess = self.state_manager.get_session(session_id) or {}
-            ctx = dict(sess.get("context") or {})
-            ctx["pending_agent_offer"] = True
-            self.state_manager.update_session(session_id, {"context": ctx})
-            show_handover_button = True
 
         products_matched_names = [p[2]["name"] for p in products] if products else []
         if not products_matched_names and topic.get("name") and should_reuse_topic:
             products_matched_names = [topic["name"]]
-        if self.response_processor and not system_error and not offer_agent:
+        if self.response_processor and not system_error:
             processed = self.response_processor.process_response(
                 raw_response=response.get("answer"),
                 user_input=message,
                 confidence=confidence,
                 conversation_state=session,
                 session_id=session_id,
-                # Low confidence triggers a human-offer prompt; escalation waits for user confirmation.
                 user_id=user_id,
                 products_matched=products_matched_names,
             )
@@ -1175,11 +1232,6 @@ class ConversationalMode:
             processed_fallback = bool(processed.get("fallback"))
             if processed.get("fallback"):
                 metrics_to_emit.append(_metric_payload("fallbacks", 1.0, conversation_id))
-            if processed.get("offer_human"):
-                sess = self.state_manager.get_session(session_id) or {}
-                ctx = dict(sess.get("context") or {})
-                ctx["pending_agent_offer"] = True
-                self.state_manager.update_session(session_id, {"context": ctx})
         else:
             answer_text = response["answer"]
             follow_up_flag = False
@@ -1192,15 +1244,13 @@ class ConversationalMode:
             self._log_service_error(
                 db, conversation_id, message, response.get("error_kind") or "system_error"
             )
-        elif offer_agent:
+        elif not retrieval_results or not sources or confidence < 0.2 or processed_fallback:
             reason = (
                 "no_chunks"
                 if not retrieval_results
-                else ("no_sources" if not sources else "low_confidence")
+                else ("no_sources" if not sources else ("fallback" if processed_fallback else "low_confidence"))
             )
             self._log_unanswered(db, conversation_id, message, reason=reason)
-        elif processed_fallback:
-            self._log_unanswered(db, conversation_id, message, reason="fallback")
 
         if processed_reason == "incomplete_input" and not products:
             recommendation = await self._build_recommendation_response(message, session_id)
@@ -1520,15 +1570,14 @@ class ConversationalMode:
             ctx["pending_quote_offer"] = True
             self.state_manager.update_session(session_id, {"context": ctx})
 
-        # If the brain phrased a can't-answer reply, arm the agent handoff so a
-        # "yes" escalates to a human. The reply text itself stays LLM-generated.
-        show_handover_button = result.confidence < 0.2
-        if not result.quote_requested and _is_fallback_like_answer(result.reply):
-            session = self.state_manager.get_session(session_id) or {}
-            ctx = dict(session.get("context") or {})
-            ctx["pending_agent_offer"] = True
-            self.state_manager.update_session(session_id, {"context": ctx})
-            show_handover_button = True
+        # MIA answers confidently and we do NOT auto-arm a human-agent handoff here.
+        # A handoff is only offered when the user asks for one or declines the
+        # completion question. Keep the "couldn't answer" signal for metrics so
+        # fallback_rate stays honest.
+        show_handover_button = False
+        if not result.quote_requested and (
+            not result.sources or result.confidence < 0.2
+        ):
             self._log_unanswered(
                 db,
                 conversation_id or session_id,
@@ -1604,12 +1653,6 @@ class ConversationalMode:
             return None
 
         confidence = _estimate_response_confidence(response, retrieval_results, [], {})
-        offer_agent = bool(response.get("offer_human")) or (not retrieval_results and confidence < 0.35)
-        if offer_agent:
-            sess = self.state_manager.get_session(session_id) or {}
-            ctx = dict(sess.get("context") or {})
-            ctx["pending_agent_offer"] = True
-            self.state_manager.update_session(session_id, {"context": ctx})
 
         _emit_metrics(
             db,
@@ -1644,7 +1687,7 @@ class ConversationalMode:
             "intent_type": "INFORMATIONAL",
             "suggested_action": None,
             "confidence": confidence,
-            "show_handover_button": offer_agent,
+            "show_handover_button": False,
             "brain": True,
             "grounded": True,
         }

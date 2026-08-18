@@ -617,7 +617,7 @@ class NoHitsRAG:
 
 
 @pytest.mark.asyncio
-async def test_no_chunks_arms_agent_offer_and_keeps_llm_reply():
+async def test_no_chunks_keeps_llm_reply_without_agent_offer():
     db = PostgresDB()
     redis = RedisCache()
     sm = StateManager(redis, db)
@@ -628,16 +628,14 @@ async def test_no_chunks_arms_agent_offer_and_keeps_llm_reply():
     out = await conv.process("what is the minimum deposit for the balanced fund", session_id, "1")
 
     assert out["mode"] == "conversational"
-    # The LLM's own can't-answer text is shown untouched (not swapped for a
-    # clarifying question and not replaced by a static retry message).
-    assert out["response"] == (
-        "I'm sorry, I can't answer that. Would you like me to connect you "
-        "with an agent who can give you more information?"
-    )
-    assert out.get("show_handover_button") is True
+    # No-chunk low-confidence answers now route through the response processor,
+    # which replies with a clarifying question - never an agent offer.
+    assert "clarify" in out["response"].lower() or "more detail" in out["response"].lower()
+    assert "agent" not in out["response"].lower()
+    assert out.get("show_handover_button") is False
     assert rag.retrieve_calls, "retrieval should still run for no-chunk questions"
     session = sm.get_session(session_id)
-    assert session["context"].get("pending_agent_offer") is True
+    assert not session["context"].get("pending_agent_offer")
 
 
 @pytest.mark.asyncio

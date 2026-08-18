@@ -109,7 +109,7 @@ async def test_no_chunks_records_unanswered_event_and_metric():
 
     out = await conv.process("what is the minimum deposit for the balanced fund", session_id, str(user.id))
 
-    assert out.get("show_handover_button") is True
+    assert out.get("show_handover_button") is False
     events = _events(db, "unanswered_question")
     assert len(events) == 1
     assert events[0].payload["reason"] == "no_chunks"

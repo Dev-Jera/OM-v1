@@ -191,7 +191,7 @@ async def test_pending_quote_offer_other_continues_to_brain():
 
 
 @pytest.mark.asyncio
-async def test_can_not_answer_brain_reply_arms_agent_offer():
+async def test_can_not_answer_brain_reply_keeps_reply_without_agent_offer():
     db = PostgresDB()
     sm = StateManager(RedisCache(), db)
     session_id = make_session(sm)
@@ -207,11 +207,12 @@ async def test_can_not_answer_brain_reply_arms_agent_offer():
 
     out = await conv.process("what is the minimum deposit for the balanced fund", session_id, "1")
 
-    # The brain's own wording is preserved; the agent handoff is armed behind it.
+    # The brain's own wording is preserved, but no agent handoff is armed: MIA
+    # must answer confidently and never volunteer a human agent.
     assert out["response"].startswith("I'm sorry, I can't answer that.")
-    assert out.get("show_handover_button") is True
+    assert out.get("show_handover_button") is False
     session = sm.get_session(session_id)
-    assert session["context"].get("pending_agent_offer") is True
+    assert not session["context"].get("pending_agent_offer")
 
 
 @pytest.mark.asyncio
