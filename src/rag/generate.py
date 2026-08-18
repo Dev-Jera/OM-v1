@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 # Override at runtime with the MIA_MODEL env var.
 MODEL_NAME = os.getenv("MIA_MODEL", "gemini-3.6-flash")
 
+# LLM provider selection: "gemini" (default, current behavior) or "openrouter"
+# (OpenAI-compatible pay-per-use gateway - no hard daily quota).
+# Read fresh inside MiaGenerator.__init__ so runtime env changes take effect.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
 # Reserved last-resort replies. The "can't answer" message is only used when no
 # LLM is available at all (generation disabled/failed hard); normally the LLM
 # phrases the can't-answer + agent offer itself. The error message is reserved
@@ -111,6 +119,9 @@ A: This product offers..."
 
 
 class MiaGenerator:
+    provider: str = "gemini"
+    openrouter_model: str = ""
+
     def __init__(
         self,
         max_context_chars: int = 12000,
@@ -118,12 +129,25 @@ class MiaGenerator:
         max_sources: int = 5,
         temperature: float = 0.2  # Lowered for financial accuracy
     ):
-        from google import genai
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError("CRITICAL: GEMINI_API_KEY is missing.")
+        self.provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+        if self.provider == "openrouter":
+            if not os.environ.get("OPENROUTER_API_KEY"):
+                raise RuntimeError("CRITICAL: OPENROUTER_API_KEY is missing.")
+            import openai as _openai_sdk
 
-        self.client = genai.Client(api_key=api_key)
+            self.client = _openai_sdk.OpenAI(
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            )
+            self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+        else:
+            from google import genai
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise RuntimeError("CRITICAL: GEMINI_API_KEY is missing.")
+
+            self.client = genai.Client(api_key=api_key)
+
         self.max_context_chars = max_context_chars
         self.min_score = min_score
         self.max_sources = max_sources
@@ -265,6 +289,29 @@ class MiaGenerator:
             logger.error(f"Error loading chunk texts: {e}")
             return {}
 
+    def _extract_response(self, response):
+        """Normalize a provider response into (text, finish_reason)."""
+        if self.provider == "openrouter":
+            text = ""
+            finish_reason = None
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                first = choices[0]
+                message = getattr(first, "message", None)
+                content = getattr(message, "content", None) if message is not None else None
+                text = (content or "").strip()
+                finish_reason = getattr(first, "finish_reason", None)
+            return text, finish_reason
+
+        text = (getattr(response, "text", "") or "").strip()
+        finish_reason = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            fr = getattr(candidates[0], "finish_reason", None)
+            # Gemini SDK may return an enum or a plain int; MAX_TOKENS = 2
+            finish_reason = getattr(fr, "value", fr)
+        return text, finish_reason
+
     async def generate(self, question: str, hits: List[Dict[str, Any]], conversation_history: List[Dict] = None) -> str:
         self.last_error_kind = None
         context, num_sources, _ = self._build_context(hits)
@@ -315,6 +362,17 @@ class MiaGenerator:
         logger.info(f"Generating response for question: {question[:100]}... with {num_sources} sources")
 
         def _sync_generate(prompt: str, max_output_tokens: int = 1200):
+            if self.provider == "openrouter":
+                return self.client.chat.completions.create(
+                    model=self.openrouter_model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_INSTRUCTION},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=max_output_tokens,
+                )
+
             from google.genai import types
             response = self.client.models.generate_content(
                 model=MODEL_NAME,
@@ -331,26 +389,26 @@ class MiaGenerator:
         for attempt in range(1, max_attempts + 1):
             try:
                 response = await asyncio.to_thread(_sync_generate, full_prompt, 1200)
-                text = (getattr(response, "text", "") or "").strip()
+                text, finish_reason = self._extract_response(response)
                 if not text:
-                    logger.warning("GenAI returned empty text response.")
+                    logger.warning("LLM returned empty text response.")
                     self.last_error_kind = "empty_output"
                     return ERROR_RETRY_MESSAGE
 
-                # Request a continuation only when Gemini itself reports the output
-                # was cut off at the token budget (finish_reason == MAX_TOKENS = 2).
-                # Checking the API field is far more reliable than text heuristics and
-                # avoids wasteful extra API calls on already-complete answers.
+                # Request a continuation only when the provider reports the output
+                # was cut off at the token budget (Gemini finish_reason MAX_TOKENS = 2;
+                # OpenAI-style "length"). Checking the API field is far more reliable
+                # than text heuristics and avoids wasteful extra API calls on
+                # already-complete answers.
                 hit_token_limit = False
                 try:
-                    candidates = getattr(response, "candidates", None) or []
-                    if candidates:
-                        finish_reason = getattr(candidates[0], "finish_reason", None)
-                        # Gemini SDK may return an enum or a plain int; MAX_TOKENS = 2
-                        finish_reason_val = getattr(finish_reason, "value", finish_reason)
-                        if finish_reason_val == 2:
+                    if self.provider == "openrouter":
+                        if finish_reason == "length":
                             hit_token_limit = True
-                            logger.info("Gemini hit max_output_tokens; requesting continuation")
+                            logger.info("OpenRouter hit max_output_tokens; requesting continuation")
+                    elif finish_reason == 2:
+                        hit_token_limit = True
+                        logger.info("Gemini hit max_output_tokens; requesting continuation")
                 except Exception:
                     # If we cannot read finish_reason, fall back to text heuristic.
                     hit_token_limit = self._looks_truncated(text)
@@ -363,13 +421,16 @@ class MiaGenerator:
                             f"Current partial answer:\n{text}"
                         )
                         continuation = await asyncio.to_thread(_sync_generate, continuation_prompt, 300)
-                        continuation_text = (getattr(continuation, "text", "") or "").strip()
+                        continuation_text, _ = self._extract_response(continuation)
                         if continuation_text:
                             text = self._merge_continuation(text, continuation_text)
                     except Exception as continuation_error:
                         logger.warning("Continuation attempt failed: %s", continuation_error)
 
-                logger.info("Successfully generated response from Gemini API")
+                logger.info(
+                    "Successfully generated response from %s API",
+                    "OpenRouter" if self.provider == "openrouter" else "Gemini",
+                )
                 return strip_meta_lead_in(text)
             except Exception as e:
                 self.last_error_kind = classify_generation_error(e)
