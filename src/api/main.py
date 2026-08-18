@@ -3031,6 +3031,43 @@ async def seed_demo_data(
     return {"success": True, "seeded": stats, "note": "Synthetic demo data only"}
 
 
+@api_router.post("/admin/sync/zoho", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
+async def admin_sync_zoho(
+    limit: Optional[int] = Query(default=None, ge=1, le=1000, description="Cap the number of product records pulled"),
+):
+    """
+    Pull Zoho CRM products into the RAG chunk pipeline.
+
+    Merges ``zoho:`` chunks into ``data/processed/website_chunks.jsonl`` and
+    product entries into ``website_index.json``; the next embed run (or a
+    manual ``scripts/generate_embeddings.py``) pushes them into Qdrant.
+
+    Only enabled when ZOHO_SYNC_ENABLED=true and Zoho credentials are set.
+    """
+    enabled = os.getenv("ZOHO_SYNC_ENABLED", "").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        raise HTTPException(status_code=403, detail="Zoho sync is not enabled on this deployment")
+
+    from src.integrations.zoho.sync import run_zoho_sync
+
+    try:
+        result = await asyncio.to_thread(run_zoho_sync, limit=limit)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - surface sync failures to the admin
+        logger.error("Zoho sync failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Zoho sync failed: {e}")
+
+    return {
+        "success": True,
+        "records": result.records,
+        "chunks": result.chunks,
+        "attached_to_existing_products": result.attached,
+        "stale_zoho_chunks_replaced": result.replaced,
+        "note": "Run scripts/generate_embeddings.py to embed the new chunks into Qdrant",
+    }
+
+
 @api_router.get("/admin/chat-console/queue", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
 async def get_chat_console_queue(
     status: Optional[str] = Query(default=None, description="Filter by waiting, escalated, active, or resolved"),

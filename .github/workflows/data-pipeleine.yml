@@ -69,3 +69,20 @@ jobs:
         python scripts/generate_embeddings.py \
           --config config/rag_config.pipeline.yml \
           --chunks-file data/processed/website_chunks.jsonl
+
+    - name: Sync Zoho CRM products
+      env:
+        ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+        ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+        ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+        ZOHO_REGION: ${{ secrets.ZOHO_REGION }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ZOHO_CLIENT_ID:-}" ]; then
+          echo "ZOHO_CLIENT_ID not set; skipping Zoho product sync"
+          exit 0
+        fi
+        python scripts/run_zoho_sync.py
+        python scripts/generate_embeddings.py \
+          --config config/rag_config.pipeline.yml \
+          --chunks-file data/processed/website_chunks.jsonl

@@ -1,0 +1,31 @@
+# Zoho CRM "Products" module field mapping -> canonical chunk fields.
+#
+# The pipeline reads Zoho CRM Products records and converts them into RAG
+# chunks that match the website product chunk schema. If the company CRM uses
+# custom/renamed fields, change the field names here - no code changes needed.
+#
+# The CRM field names below are the standard Zoho CRM Products module fields.
+
+module: Products
+
+fields:
+  id: id                       # Zoho record id
+  name: Product_Name           # product title
+  text: Description            # marketing description used as chunk text
+  category: Product_Category   # category picklist (or "")
+  url: Website                 # optional website link
+  active: Active               # boolean/picklist flag
+  price: Unit_Price            # currency amount
+  product_code: Product_Code   # internal product code
+
+filter:
+  active_only: true            # skip records where Active is false
+
+# Retrieval only sees the chunk `text`, so include what matters for answers.
+include_price_in_text: true
+include_product_code_in_text: false
+
+# Fallback category/subcategory used when a product cannot be mapped to an
+# existing website product.
+slug_fallback_category: general
+slug_fallback_subcategory: products
