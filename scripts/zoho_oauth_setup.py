@@ -23,7 +23,12 @@ from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv  # noqa: E402
 
-SCOPE = "ZohoCRM.modules.products.READ"
+SCOPE = (
+    "ZohoCRM.modules.products.READ,"
+    "ZohoCRM.modules.Mia_Bot_Metrics.ALL,"
+    "ZohoCRM.modules.Mia_Escalations.ALL,"
+    "ZohoCRM.settings.modules.CREATE"
+)
 REDIRECT_PORT = 8080
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 

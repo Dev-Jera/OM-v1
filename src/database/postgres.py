@@ -315,11 +315,14 @@ class PostgresDB:
         end: datetime,
         role: Optional[str] = None,
         limit: Optional[int] = None,
+        conversation_id: Optional[str] = None,
     ) -> List[Message]:
         messages = [
             m
             for m in self._messages
-            if start <= m.timestamp < end and (role is None or m.role == role)
+            if start <= m.timestamp < end
+            and (role is None or m.role == role)
+            and (conversation_id is None or str(getattr(m, "conversation_id", "") or "") == str(conversation_id))
         ]
         messages.sort(key=lambda m: m.timestamp, reverse=True)
         if limit:

@@ -30,7 +30,16 @@ class EndEscalationRequest(BaseModel):
 async def escalate(body: EscalateRequest):
     if not body.session_id:
         return {"success": False, "error": "Missing session_id"}
-    state = state_manager.mark_escalated(body.session_id, reason=body.reason, metadata=body.metadata or {})
+    # Route through EscalationService so every escalation path (endpoint,
+    # button, chat trigger) also fires the Zoho handoff hook.
+    from src.integrations.policy.escalation_service import EscalationService
+
+    EscalationService(state_manager=state_manager).escalate_to_human(
+        session_id=body.session_id,
+        reason=body.reason or "customer_requested_agent",
+        metadata=body.metadata or {},
+    )
+    state = state_manager.get_escalation_state(body.session_id)
     # Path attribution: a direct /escalate call means the user chose a human agent.
     session = state_manager.get_session(body.session_id) or {}
     conversation_id = session.get("conversation_id") or body.session_id

@@ -252,6 +252,7 @@ class PostgresDB:
         end: datetime,
         role: Optional[str] = None,
         limit: Optional[int] = None,
+        conversation_id: Optional[str] = None,
     ) -> List[Message]:
         with self._session() as s:
             stmt = select(Message).where(
@@ -260,6 +261,8 @@ class PostgresDB:
             )
             if role:
                 stmt = stmt.where(Message.role == str(role))
+            if conversation_id is not None:
+                stmt = stmt.where(Message.conversation_id == str(conversation_id))
             stmt = stmt.order_by(Message.timestamp.desc())
             if limit:
                 stmt = stmt.limit(int(limit))

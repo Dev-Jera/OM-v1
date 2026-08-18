@@ -35,6 +35,20 @@ class EscalationService:
             self.queue_backend.add_to_queue(escalation_record)
         else:
             logger.warning("No queue backend configured. Escalation not persisted.")
+        # Hand off to Zoho CRM (fire-and-forget; gated by ZOHO_ESCALATION_PUSH_ENABLED).
+        # Never allowed to break the escalation itself.
+        try:
+            from src.integrations.zoho.escalation_push import push_escalation_to_zoho
+
+            push_escalation_to_zoho(
+                session_id=session_id,
+                reason=reason,
+                user_id=user_id,
+                metadata=metadata or {},
+                db=getattr(self.state_manager, "db", None) if self.state_manager else None,
+            )
+        except Exception:
+            logger.warning("Zoho escalation push hook failed; continuing without it", exc_info=True)
         return escalation_record
 
     def agent_join(self, session_id: str, agent_id: str):
