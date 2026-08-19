@@ -3,11 +3,42 @@ Conversational mode - RAG-powered free-form chat
 """
 
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
 import logging
 import re
 import time
 
 logger = logging.getLogger(__name__)
+
+
+def _time_greeting_eat() -> str:
+    """Return 'Good morning', 'Good afternoon', or 'Good evening' in EAT (UTC+3)."""
+    eat = timezone(timedelta(hours=3))
+    hour = datetime.now(eat).hour
+    if hour < 12:
+        return "Good morning"
+    elif hour < 18:
+        return "Good afternoon"
+    else:
+        return "Good evening"
+
+
+def _derive_name_from_email(email: str) -> Optional[str]:
+    """Extract a human-readable first name from an email address.
+
+    Examples:
+        john.doe@company.com  → 'John'
+        jane_smith@company.com → 'Jane'
+        john@company.com       → 'John'
+        info@company.com       → None (too generic)
+    """
+    local = (email or "").split("@")[0]
+    parts = re.split(r"[._\-]+", local)
+    skip = {"info", "admin", "support", "hello", "contact", "enquiry", "enquiries", "office", "team", "hr"}
+    name_parts = [p for p in parts if p.isalpha() and p.lower() not in skip and len(p) > 1]
+    if name_parts:
+        return name_parts[0].capitalize()
+    return None
 
 
 def _is_greeting(message: str) -> bool:
@@ -28,11 +59,11 @@ def _is_greeting(message: str) -> bool:
 CLIENT_NAME_MASK = ":clients_name"
 
 IDENTITY_ASK_PROMPT = (
-    "Hello, I'm Mia, your Old Mutual assistant. I'd like to know your name and email address "
-    "so I can know you better and follow up with you if needed."
+    "{time_greeting}, I'm Mia, your Old Mutual assistant. Could you share your email address "
+    "so I can know you better and follow up with you if needed?"
 )
 IDENTITY_ASK_EMAIL_PROMPT = "Thanks! Could you also share your email address so we can follow up with you?"
-IDENTITY_CONFIRMED_PROMPT = "Thank you! Noted. How can I help you today?"
+IDENTITY_CONFIRMED_PROMPT = "{time_greeting} Thank you! Noted. How can I help you today?"
 
 # --------------------------------------------------------------------------- #
 # Conversation completion (goodbye flow)
@@ -2169,11 +2200,11 @@ class ConversationalMode:
                 logger.warning("[identity] failed to record identity event: %s", exc)
 
     def _maybe_handle_identity_capture(self, message: str, session_id: str, user_id: str, conversation_id: Optional[str], session: Dict[str, Any], db, start_time: float) -> Optional[Dict[str, Any]]:
-        """Greeting flow: ask for the user's name + email once per user (privacy-safe).
+        """Greeting flow: ask for the user's email once per user (privacy-safe).
 
         Returns a response payload when this turn is consumed by identity
         capture, otherwise None so normal processing continues. The client's
-        name is masked (:clients_name); the email is stored for follow-up.
+        name is derived from the email address; the email is stored for follow-up.
         """
         try:
             if not message or not (message or "").strip():
@@ -2184,6 +2215,7 @@ class ConversationalMode:
 
             ctx = dict(session.get("context") or {})
             pending = bool(ctx.get("pending_identity_capture"))
+            time_greeting = _time_greeting_eat()
 
             if not pending:
                 if not _is_greeting(message):
@@ -2195,7 +2227,16 @@ class ConversationalMode:
                     except Exception:
                         user = None
                 if user is not None and (getattr(user, "email", None) or "").strip():
-                    return None  # identity already captured -> normal greeting flow
+                    name = (getattr(user, "name", None) or "").strip()
+                    if name:
+                        return self._identity_response(
+                            f"{time_greeting}, {name}! How can I help you today?",
+                            "greeting_returning",
+                        )
+                    return self._identity_response(
+                        f"{time_greeting}! How can I help you today?",
+                        "greeting_returning",
+                    )
                 ctx["pending_identity_capture"] = True
                 self.state_manager.update_session(session_id, {"context": ctx})
                 _emit_metrics(
@@ -2203,31 +2244,29 @@ class ConversationalMode:
                     [_metric_payload("response_latency", time.time() - start_time, conversation_id)],
                 )
                 self._emit_intent_event(db, conversation_id, "greeting", "NO_RETRIEVAL", message, start_time)
-                return self._identity_response(IDENTITY_ASK_PROMPT, "greeting")
+                ask = IDENTITY_ASK_PROMPT.format(time_greeting=time_greeting)
+                return self._identity_response(ask, "greeting")
 
             # Pending capture: this turn should contain the identity info.
             if _is_greeting(message):
-                return self._identity_response(IDENTITY_ASK_PROMPT, "greeting")
+                ask = IDENTITY_ASK_PROMPT.format(time_greeting=time_greeting)
+                return self._identity_response(ask, "greeting")
 
             email = _extract_email(message)
-            name = _extract_name(message, email)
 
             if email:
+                name = _derive_name_from_email(email)
                 self._save_identity(db, user_id, name, email, conversation_id, via="greeting")
                 ctx.pop("pending_identity_capture", None)
                 self.state_manager.update_session(session_id, {"context": ctx})
-                return self._identity_response(IDENTITY_CONFIRMED_PROMPT, "identity_captured")
+                confirmed = IDENTITY_CONFIRMED_PROMPT.format(time_greeting=time_greeting)
+                return self._identity_response(confirmed, "identity_captured")
 
             if _looks_like_question(message):
                 # Not identity info — stop waiting and process normally.
                 ctx.pop("pending_identity_capture", None)
                 self.state_manager.update_session(session_id, {"context": ctx})
                 return None
-
-            if name:
-                # Partial: store the name, keep waiting for the email.
-                self._save_identity(db, user_id, name, None, conversation_id, via="greeting", partial=True)
-                return self._identity_response(IDENTITY_ASK_EMAIL_PROMPT, "identity_partial")
 
             # Unrecognized short reply: don't block the conversation.
             ctx.pop("pending_identity_capture", None)

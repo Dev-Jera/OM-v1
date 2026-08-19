@@ -1,20 +1,21 @@
 """Tests for the greeting identity-capture flow.
 
-A new user who greets the bot is asked for their name and email. The name is
-masked in analytics (:clients_name); the email is stored on the user record
-for follow-up. Capture must never block a real question.
+A new user who greets the bot is asked for their email. The name is derived
+from the email address; the email is stored on the user record for follow-up.
+Capture must never block a real question.
 """
 
 import pytest
 
 from src.chatbot.modes.conversational import (
     CLIENT_NAME_MASK,
-    IDENTITY_ASK_EMAIL_PROMPT,
     IDENTITY_ASK_PROMPT,
     ConversationalMode,
+    _derive_name_from_email,
     _extract_email,
     _extract_name,
     _looks_like_question,
+    _time_greeting_eat,
 )
 from src.database.postgres import PostgresDB
 
@@ -71,7 +72,9 @@ def test_greeting_triggers_identity_ask():
     )
 
     assert resp is not None
-    assert resp["response"] == IDENTITY_ASK_PROMPT
+    time_greeting = _time_greeting_eat()
+    assert time_greeting in resp["response"]
+    assert "email" in resp["response"].lower()
     assert resp["intent"] == "greeting"
     assert sm.sessions["s1"]["context"]["pending_identity_capture"] is True
 
@@ -83,14 +86,14 @@ def test_identity_capture_persists_name_and_email_masked():
 
     mode._maybe_handle_identity_capture("hello", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0)
     resp = mode._maybe_handle_identity_capture(
-        "John Doe, john.doe@example.com", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0
+        "john.doe@example.com", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0
     )
 
     assert resp is not None
     assert resp["intent"] == "identity_captured"
     stored = db.get_user_by_id(user.id)
     assert stored.email == "john.doe@example.com"
-    assert stored.name == "John Doe"
+    assert stored.name == "John"  # derived from email local part
     assert stored.identity_captured_at is not None
     assert "pending_identity_capture" not in sm.sessions["s1"]["context"]
 
@@ -101,24 +104,21 @@ def test_identity_capture_persists_name_and_email_masked():
     assert captured[0].payload["email"] == "john.doe@example.com"
 
 
-def test_identity_capture_partial_then_email():
+def test_identity_capture_email_derives_name():
     db = PostgresDB()
     user = db.get_or_create_user("+256700000003")
     mode, sm = _make_mode(db, "s1")
 
     mode._maybe_handle_identity_capture("hi", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0)
-    resp = mode._maybe_handle_identity_capture("John", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0)
-
-    assert resp is not None
-    assert resp["response"] == IDENTITY_ASK_EMAIL_PROMPT
-    assert db.get_user_by_id(user.id).name == "John"
-    assert "pending_identity_capture" in sm.sessions["s1"]["context"]
-
     resp = mode._maybe_handle_identity_capture(
         "john@example.com", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0
     )
-    assert resp is not None and resp["intent"] == "identity_captured"
-    assert db.get_user_by_id(user.id).email == "john@example.com"
+
+    assert resp is not None
+    assert resp["intent"] == "identity_captured"
+    stored = db.get_user_by_id(user.id)
+    assert stored.email == "john@example.com"
+    assert stored.name == "John"  # derived from email
 
 
 def test_identity_capture_never_blocks_a_real_question():
@@ -146,4 +146,6 @@ def test_identity_ask_skipped_once_email_known():
         "hi", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0
     )
 
-    assert resp is None  # normal greeting flow (already known)
+    assert resp is not None  # personalized greeting for returning user
+    assert resp["intent"] == "greeting_returning"
+    assert "Jane" in resp["response"]

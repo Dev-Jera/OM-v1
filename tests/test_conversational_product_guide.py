@@ -351,16 +351,14 @@ async def test_truncated_greeting_falls_back_to_full_default_reply():
     conv = ConversationalMode(DummyRAG(), NoMatchMatcher(), sm)
     conv.small_talk_responder = TruncatedSmallTalkResponder()
 
-    # Known identity -> greeting falls through to the small-talk path.
+    # Known identity -> personalized returning-user greeting (not small-talk).
     db.set_user_identity(user.id, name="Known User", email="known@example.com")
 
     out = await conv.process("Hello", session_id, str(user.id))
 
     assert out["mode"] == "conversational"
-    assert out["response"] == (
-        "Hey! I\u2019m MIA, your Old Mutual assistant.\n"
-        "You can ask me about our products, benefits, coverage, or how to get a quote."
-    )
+    assert "Known User" in out["response"]
+    assert out["intent"] == "greeting_returning"
 
 
 @pytest.mark.asyncio
