@@ -46,6 +46,30 @@ def _make_filters_key(filters: Optional[Dict[str, Any]]) -> str:
         return str(filters)
 
 
+def _hit_label(hit: Dict[str, Any]) -> str:
+    """Compact human-readable identity of a chunk: doc_id | title."""
+    payload = hit.get("payload") or {}
+    doc_id = str(payload.get("doc_id") or hit.get("id") or "?")
+    title = str(payload.get("title") or "").strip()
+    return f"{doc_id} | {title}" if title else doc_id
+
+
+def _log_final_chunks(final_hits: List[Dict[str, Any]]) -> None:
+    """Log exactly which chunks are going to the LLM, so answers can be
+    traced back to their source material in the server logs."""
+    logger.info("RAG final chunks going to the LLM (%s):", len(final_hits))
+    for i, h in enumerate(final_hits, 1):
+        payload = h.get("payload") or {}
+        snippet = " ".join(str(payload.get("text") or "").split())[:100]
+        logger.info(
+            "  final [%s] score=%.4f %s | \"%s\"",
+            i,
+            float(h.get("score") or 0),
+            _hit_label(h),
+            snippet,
+        )
+
+
 def _rerank_by_term_overlap(hits: List[Dict[str, Any]], search_query: str, fusion_scores: Optional[Dict[str, float]] = None) -> None:
     """Sort hits in place: primary = fusion/raw score, query-term overlap is a tiebreaker only.
     When fusion_scores (RRF) are provided, they replace the raw store score so dense
@@ -172,6 +196,7 @@ def retrieve_context(
         cached_hits = _cache_get(_RETRIEVAL_CACHE, retrieval_cache_key)
         if cached_hits is not None:
             logger.info("Retrieval cache hit for query")
+            _log_final_chunks(list(cached_hits))
             return list(cached_hits)
 
         logger.info(f"Initializing embedder with provider: {cfg.embeddings.provider}")
@@ -264,10 +289,19 @@ def retrieve_context(
             if h["id"] not in seen_ids:
                 hits.append(h)
                 seen_ids.add(h["id"])
+        logger.info("RAG fetched %s candidate chunks for '%s'", len(hits), question[:80])
+        for i, h in enumerate(hits, 1):
+            logger.info(
+                "  candidate [%s] score=%.4f %s",
+                i,
+                float(h.get("score") or 0),
+                _hit_label(h),
+            )
         _rerank_by_term_overlap(hits, search_query, fusion_scores=fusion_scores)
         final_hits = hits[:top_k]
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         logger.info(f"Returning {len(final_hits)} hits after reranking")
+        _log_final_chunks(final_hits)
         _cache_set(_RETRIEVAL_CACHE, retrieval_cache_key, list(final_hits))
 
         total_ms = (time.monotonic() - start_ts) * 1000
