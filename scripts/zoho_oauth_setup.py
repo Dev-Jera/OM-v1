@@ -5,7 +5,10 @@ Reads ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET / ZOHO_REGION from the environment
 (or ``--env`` file), opens a browser to Zoho's consent screen, and prints the
 resulting refresh token. Use ``--write`` to store it into the .env file.
 
-Scope used: ZohoCRM.modules.products.READ (least privilege for the pipeline).
+Scope used by default: ZohoCRM.modules.ALL + ZohoCRM.settings.modules.ALL.
+Per-module scopes are rejected at consent time when the custom module does
+not exist yet (which is what this token is needed to create). Use --scope to
+narrow it once the modules exist, if desired.
 """
 
 from __future__ import annotations
@@ -23,12 +26,12 @@ from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv  # noqa: E402
 
-SCOPE = (
-    "ZohoCRM.modules.products.READ,"
-    "ZohoCRM.modules.Mia_Bot_Metrics.ALL,"
-    "ZohoCRM.modules.Mia_Escalations.ALL,"
-    "ZohoCRM.settings.modules.CREATE"
-)
+# NOTE: we use the broad ``modules.ALL`` / ``settings.modules.ALL`` scopes on
+# purpose. Per-module scopes (e.g. ``ZohoCRM.modules.Mia_Bot_Metrics.ALL``)
+# are rejected by Zoho at consent time if that custom module does not exist
+# yet — and we need the token precisely to create those modules. ``modules.ALL``
+# covers every standard and custom module, present or future.
+SCOPE = "ZohoCRM.modules.ALL,ZohoCRM.settings.modules.ALL"
 REDIRECT_PORT = 8080
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 
@@ -72,7 +75,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Mint a Zoho refresh token for CRM Products")
     parser.add_argument("--env", type=Path, default=None, help=".env file to read client id/secret/region from")
     parser.add_argument("--write", action="store_true", help="Write ZOHO_REFRESH_TOKEN into the .env file")
+    parser.add_argument("--scope", type=str, default=None, help="Override the OAuth scope (default: modules.ALL + settings.modules.ALL)")
     args = parser.parse_args()
+
+    scope = (args.scope or SCOPE).strip()
 
     if args.env:
         load_dotenv(args.env)
@@ -91,7 +97,7 @@ def main() -> int:
 
     auth_url = f"https://{accounts_host}/oauth/v2/auth?" + urlencode(
         {
-            "scope": SCOPE,
+            "scope": scope,
             "client_id": client_id,
             "response_type": "code",
             "redirect_uri": REDIRECT_URI,
@@ -100,6 +106,7 @@ def main() -> int:
         }
     )
     print("Opening browser for Zoho consent...")
+    print(f"Requesting scope: {scope}")
     webbrowser.open(auth_url)
     deadline = time.time() + 180
     while not _code and not _error and time.time() < deadline:

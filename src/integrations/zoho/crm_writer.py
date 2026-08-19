@@ -58,4 +58,4 @@ class ZohoCRMWriter:
         """
         url = f"{self.token_manager.api_base_url}/crm/v2/{self.module}/upsert"
         body = {"data": records, "duplicate_check_fields": duplicate_check_fields}
-        return self._request("PUT", url, body)
+        return self._request("POST", url, body)
