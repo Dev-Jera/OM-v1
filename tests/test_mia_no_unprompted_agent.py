@@ -12,8 +12,10 @@ from src.rag.generate import SYSTEM_INSTRUCTION as GENERATE_INSTRUCTION
 
 
 def test_generate_prompt_never_volunteers_a_human_agent():
-    assert "NEVER OFFER A HUMAN AGENT UNPROMPTED" in GENERATE_INSTRUCTION
+    assert "HUMAN AGENT AND LINKS" in GENERATE_INSTRUCTION
     assert "Only answer from the Retrieved Data" in GENERATE_INSTRUCTION
+    assert "NEVER make up or guess URLs" in GENERATE_INSTRUCTION
+    assert "unsatisfied" in GENERATE_INSTRUCTION
     for old_offer in (
         "connect you with an agent",
         "Would you like me to connect you",
@@ -24,8 +26,10 @@ def test_generate_prompt_never_volunteers_a_human_agent():
 
 
 def test_brain_prompt_never_volunteers_a_human_agent():
-    assert "HUMAN AGENT:" in BRAIN_INSTRUCTION
+    assert "HUMAN AGENT AND LINKS:" in BRAIN_INSTRUCTION
     assert "NEVER suggest, offer, or volunteer" in BRAIN_INSTRUCTION
+    assert "NEVER make up or guess URLs" in BRAIN_INSTRUCTION
+    assert "unsatisfied" in BRAIN_INSTRUCTION
     for old_offer in (
         "connect you with an agent",
         "Would you like me to connect you",
