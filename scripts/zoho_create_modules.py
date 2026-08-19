@@ -29,6 +29,7 @@ METRICS_MODULE = {
     "singular_label": "Mia Bot Metric",
     "plural_label": "Mia Bot Metrics",
     "fields": [
+        {"field_label": "Name", "data_type": "text", "length": 255},
         {"field_label": "Metric Date", "data_type": "date", "length": 20},
         {"field_label": "Conversations", "data_type": "integer", "length": 16},
         {"field_label": "Resolved", "data_type": "integer", "length": 16},
@@ -53,6 +54,7 @@ ESCALATIONS_MODULE = {
     "singular_label": "Mia Escalation",
     "plural_label": "Mia Escalations",
     "fields": [
+        {"field_label": "Name", "data_type": "text", "length": 255},
         {"field_label": "Escalated At", "data_type": "datetime", "length": 20},
         {"field_label": "Conversation ID", "data_type": "text", "length": 64},
         {"field_label": "Session ID", "data_type": "text", "length": 128},
@@ -77,13 +79,13 @@ ESCALATIONS_MODULE = {
 # These are the names the push code writes to.
 FIELD_API_NAMES = {
     "Mia_Bot_Metrics": [
-        "Metric_Date", "Conversations", "Resolved", "Escalated", "Could_Not_Answer",
+        "Name", "Metric_Date", "Conversations", "Resolved", "Escalated", "Could_Not_Answer",
         "Bot_Down", "Resolution_Rate", "Self_Serve_Rate", "Fallback_Rate",
         "Bot_Down_Rate", "Off_Hours_Rate", "Quote_to_Payment_Rate",
         "Repeat_User_Rate", "CSAT", "Avg_Latency_Seconds", "Effort_Hours_Saved",
     ],
     "Mia_Escalations": [
-        "Escalated_At", "Conversation_ID", "Session_ID", "Reason", "Customer_Name",
+        "Name", "Escalated_At", "Conversation_ID", "Session_ID", "Reason", "Customer_Name",
         "Phone", "Zoho_Contact_Id", "Transcript", "Status",
     ],
 }

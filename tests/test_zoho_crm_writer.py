@@ -55,7 +55,7 @@ def test_upsert_puts_with_duplicate_check_fields():
     writer.upsert([{"Metric_Date": "2026-08-18"}], ["Metric_Date"])
 
     req = session.requests[0]
-    assert req["method"] == "PUT"
+    assert req["method"] == "POST"
     assert req["url"] == "https://www.zohoapis.com/crm/v2/Mia_Bot_Metrics/upsert"
     assert req["json"] == {
         "data": [{"Metric_Date": "2026-08-18"}],

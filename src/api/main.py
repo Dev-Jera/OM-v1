@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.api.escalation import router as escalation_router
+from src.api.admin_pipelines import router as admin_pipelines_router
 from src.api.endpoints.payments import payments_api
 from src.api.endpoints.policies import policies_api
 from src.api.endpoints.premiums import premiums_api
@@ -3077,6 +3078,7 @@ async def end_session(session_id: str, ended_by: str = "user"):
 
 # API versioning: expose routes under /api/v1
 app.include_router(api_router, prefix="/api/v1")
+app.include_router(admin_pipelines_router, prefix="/api/v1")
 
 
 def _strip_heading_from_text(text: str, heading: str) -> str:

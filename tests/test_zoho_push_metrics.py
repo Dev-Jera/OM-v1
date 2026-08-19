@@ -36,6 +36,7 @@ def test_record_mapping_covers_all_crm_fields():
     record = impact_payload_to_crm_record(PAYLOAD, "2026-08-18")
 
     assert record == {
+        "Name": "2026-08-18",
         "Metric_Date": "2026-08-18",
         "Conversations": 10,
         "Resolved": 6,
