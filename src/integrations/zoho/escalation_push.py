@@ -80,6 +80,7 @@ def build_escalation_record(
             zoho_contact_id = str(getattr(user, "zoho_contact_id", "") or "")
 
     return {
+        "Name": str(conversation_id or session_id or "escalation"),
         "Escalated_At": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "Conversation_ID": conversation_id,
         "Session_ID": str(session_id or ""),

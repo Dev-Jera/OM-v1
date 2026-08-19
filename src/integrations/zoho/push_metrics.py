@@ -28,6 +28,7 @@ def impact_payload_to_crm_record(payload: Dict[str, Any], metric_date: str) -> D
     kpis = {k["key"]: k["value"] for k in payload.get("kpis", [])}
     resolution = payload.get("resolution", {})
     return {
+        "Name": metric_date,
         "Metric_Date": metric_date,
         "Conversations": payload.get("window", {}).get("conversations", 0),
         "Resolved": resolution.get("resolved", 0),
