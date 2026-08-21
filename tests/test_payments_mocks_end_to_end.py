@@ -12,6 +12,12 @@ def _auth_bypass():
     return None
 
 
+# Customer payment tests use a real session capability, matching production.
+app.dependency_overrides[api_key_protection] = _auth_bypass
+client.post("/api/v1/session", json={"user_id": "payment-test-user"})
+app.dependency_overrides.pop(api_key_protection, None)
+
+
 def _initiate_payload(quote_id: str, simulate_outcome: str = "success"):
     return {
         "quote_id": quote_id,

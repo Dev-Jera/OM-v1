@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.integrations.contracts.payments import PaymentRequest, PaymentResponse
@@ -15,10 +15,25 @@ from src.integrations.policy.response_wrappers import (
     normalize_quotation_response,
     normalize_underwriting_response,
 )
+from src.chatbot.dependencies import session_user_id_from_request
 
 api = APIRouter()
 payments_api = api
 payment_service = PaymentService()
+
+
+def _require_payment_owner(request: Request, reference: str) -> None:
+    transaction = payment_service.db.get_payment_transaction_by_reference(reference)
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Payment transaction not found")
+    metadata = getattr(transaction, "metadata", None) or {}
+    owner = metadata.get("user_id")
+    if not owner:
+        if os.getenv("ENVIRONMENT", "development").lower() in {"production", "prod"}:
+            raise HTTPException(status_code=403, detail="Payment ownership unavailable")
+        return
+    if owner != session_user_id_from_request(request):
+        raise HTTPException(status_code=403, detail="Payment access denied")
 
 
 class PaymentInitiateRequest(BaseModel):
@@ -129,11 +144,19 @@ def _extract_customer_name(metadata: Dict[str, Any], underwriting_data: Dict[str
 
 
 @api.post("/initiate", tags=["Payments"])
-async def initiate_payment(request: PaymentInitiateRequest):
+async def initiate_payment(request: PaymentInitiateRequest, http_request: Request):
+    owner_id = None
+    try:
+        owner_id = session_user_id_from_request(http_request)
+    except HTTPException:
+        if os.getenv("ENVIRONMENT", "development").lower() in {"production", "prod"}:
+            raise
     metadata = {
         "payee_name": request.payee_name,
         **(request.metadata or {}),
     }
+    if owner_id:
+        metadata["user_id"] = owner_id
 
     payment_request = PaymentRequest(
         reference=request.quote_id,
@@ -308,16 +331,18 @@ async def buy_now_flow_step(request: BuyNowFlowStepRequest):
 
 
 @api.get("/status/{quote_id}", tags=["Payments"])
-async def get_payment_status(quote_id: str):
+async def get_payment_status(quote_id: str, request: Request):
     try:
+        _require_payment_owner(request, quote_id)
         return _payment_response_to_dict(payment_service.get_payment_status(quote_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Payment transaction not found") from exc
 
 
 @api.get("/transactions/{quote_id}", tags=["Payments"])
-async def get_payment_transaction(quote_id: str):
+async def get_payment_transaction(quote_id: str, request: Request):
     try:
+        _require_payment_owner(request, quote_id)
         return payment_service.get_payment_transaction(quote_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Payment transaction not found") from exc
@@ -378,7 +403,7 @@ async def underwrite_quote_pay(request: UnderwriteQuotePayRequest):
             },
         ) from e
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail="Payment request could not be processed") from e
 
 
 async def run_underwrite_quote_policy_payment(

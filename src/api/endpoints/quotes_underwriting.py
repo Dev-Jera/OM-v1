@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Request
 from fastapi.responses import Response
 
 from src.integrations.contracts.quotes import (
@@ -49,6 +49,13 @@ from src.integrations.quote_downloads import (
     register_quote_pdf,
     build_download_url,
 )
+from src.chatbot.dependencies import session_user_id_from_request
+
+
+def _require_quote_owner(request: Request, quote: Dict[str, Any]) -> None:
+    owner = quote.get("user_id") or (quote.get("metadata") or {}).get("user_id")
+    if not owner or owner != session_user_id_from_request(request):
+        raise HTTPException(status_code=403, detail="Quote access denied")
 from src.integrations.notifications import email_service
 from src.integrations.underwriting import run_quote_preview
 from src.integrations.policy.journey_orchestrator import journey_orchestrator
@@ -215,7 +222,7 @@ async def preview_quote(
         raise
     except Exception as e:
         logger.exception(f"[{trace_id}] Failed to generate quote preview")
-        raise HTTPException(status_code=500, detail=f"Failed to generate quote: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate quote")
 
 
 @api.post("/{product_id}/underwriting/assess")
@@ -324,7 +331,7 @@ async def assess_underwriting(
         raise
     except Exception as e:
         logger.exception(f"[{trace_id}] Failed to assess underwriting")
-        raise HTTPException(status_code=500, detail=f"Assessment failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Assessment failed")
 
 
 @api.post("/{product_id}/quotes/finalize")
@@ -435,15 +442,16 @@ async def finalize_quote(
         raise
     except Exception as e:
         logger.exception(f"[{trace_id}] Failed to finalize quote")
-        raise HTTPException(status_code=500, detail=f"Finalization failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Finalization failed")
 
 
 @api.get("/quotes/{quote_id}")
-async def get_quote(quote_id: str) -> QuoteRetrievalResponse:
+async def get_quote(quote_id: str, request: Request) -> QuoteRetrievalResponse:
     """Retrieve an existing quote by ID."""
     quote = get_quote_metadata(quote_id)
     if not quote:
         raise HTTPException(status_code=404, detail=f"Quote {quote_id} not found")
+    _require_quote_owner(request, quote)
 
     return QuoteRetrievalResponse(
         quote_id=quote["quote_id"],
@@ -462,11 +470,13 @@ async def get_quote(quote_id: str) -> QuoteRetrievalResponse:
 
 
 @api.get("/quotes/{quote_id}/download")
-async def download_quote_pdf(quote_id: str):
+async def download_quote_pdf(quote_id: str, request: Request):
     """Download quote as PDF."""
     pdf_bytes = get_quote_pdf(quote_id)
     if not pdf_bytes:
         raise HTTPException(status_code=404, detail=f"PDF not found for quote {quote_id}")
+    quote = get_quote_metadata(quote_id) or {}
+    _require_quote_owner(request, quote)
 
     return Response(
         content=pdf_bytes,
