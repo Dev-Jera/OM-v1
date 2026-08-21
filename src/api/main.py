@@ -1909,7 +1909,7 @@ async def create_session(
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        visitor_id = request.cookies.get("om_visitor_id") or f"web-visitor-{secrets.token_urlsafe(24)}"
+        visitor_id = request.cookies.get("om_visitor_id") or f"web-visitor-{secrets.token_urlsafe(14)}"
         user = db.get_or_create_user(phone_number=visitor_id)
         session_id = state_manager.create_session(str(user.id))
         response.set_cookie("om_chat_session", create_session_capability(session_id, str(user.id)), httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=2592000, path="/")
