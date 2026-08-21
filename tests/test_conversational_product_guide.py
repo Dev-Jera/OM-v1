@@ -570,8 +570,8 @@ async def test_followup_uses_previous_user_turn_when_no_product_match():
 
     assert out["mode"] == "conversational"
     q = conv.rag.retrieve_calls[-1]["query"].lower()
-    assert "context from previous question" in q
-    assert "tell me about travel insurance" in q
+    assert "user previously asked: tell me about travel insurance" in q
+    assert "assistant answered:" in q
     assert "follow-up question" in q
 
 

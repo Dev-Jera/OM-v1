@@ -507,6 +507,23 @@ def _is_followup_message(message: str) -> bool:
     if m.startswith(followup_starts):
         return True
 
+    clarification_patterns = (
+        r"\bwhat do you mean\b",
+        r"\bwhat did you mean\b",
+        r"\bwhat does .{1,40}?\bmean\b",
+        r"\bwhat is meant by\b",
+        r"\bmeaning of\b",
+        r"\bcan you explain\b",
+        r"\bcould you explain\b",
+        r"^explain\b",
+        r"\bclarify\b",
+        r"\belaborate\b",
+        r"\bi don'?t understand\b",
+        r"\bin other words\b",
+    )
+    if any(re.search(p, m) for p in clarification_patterns):
+        return True
+
     if re.search(r"\b(it|this|that|they|them|those|these)\b", m):
         return True
 
@@ -526,19 +543,41 @@ def _last_user_turn(conversation_history: List[Dict[str, Any]]) -> Optional[str]
     return None
 
 
+def _last_assistant_turn(conversation_history: List[Dict[str, Any]]) -> Optional[str]:
+    for msg in reversed(conversation_history or []):
+        role = (msg.get("role") or "").strip().lower()
+        content = (msg.get("content") or "").strip()
+        if role == "assistant" and content:
+            return content
+    return None
+
+
+_AUGMENT_ASSISTANT_CHARS = 400
+
+
 def _augment_query_with_history(message: str, conversation_history: List[Dict[str, Any]], *, use_history: bool) -> str:
     if not use_history:
         return message
 
     previous_user_turn = _last_user_turn(conversation_history)
-    if not previous_user_turn:
+    previous_assistant_turn = _last_assistant_turn(conversation_history)
+    if not previous_user_turn and not previous_assistant_turn:
         return message
 
     lowered = message.lower()
-    if previous_user_turn.lower() in lowered:
+    if previous_user_turn and previous_user_turn.lower() in lowered:
         return message
 
-    return f"Context from previous question: {previous_user_turn}. Follow-up question: {message}"
+    parts = []
+    if previous_user_turn:
+        parts.append(f"user previously asked: {previous_user_turn}")
+    if previous_assistant_turn:
+        condensed = " ".join(previous_assistant_turn.split())
+        if len(condensed) > _AUGMENT_ASSISTANT_CHARS:
+            condensed = condensed[: _AUGMENT_ASSISTANT_CHARS - 3].rstrip() + "..."
+        parts.append(f"assistant answered: {condensed}")
+    context_text = "; ".join(parts)
+    return f"Context - {context_text}. Follow-up question: {message}"
 
 
 def _is_fallback_like_answer(answer: str) -> bool:

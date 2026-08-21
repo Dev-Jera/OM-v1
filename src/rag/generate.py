@@ -337,7 +337,10 @@ class MiaGenerator:
         context_note = (
             f"**Instructions:** Using the {num_sources} source(s) below, synthesize a natural conversational answer. "
             "Do NOT copy headings or Q&A format from sources - reformulate in your own words. "
-            "Do not add facts not present in the sources."
+            "Do not add facts not present in the sources. "
+            "If the sources do not actually address what the user is asking, do NOT force them into the answer - "
+            "ignore them and respond naturally to the question using the recent conversation, as an Old Mutual "
+            "insider would, without inventing product facts."
             if num_sources > 0
             else (
                 "You have no reference material for this question. Do NOT mention documents, "
