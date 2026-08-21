@@ -41,7 +41,9 @@ CANNOT_ANSWER_MESSAGE = (
 )
 
 ERROR_RETRY_MESSAGE = (
-    "I'm having trouble retrieving those details right now. Please try again in a moment."
+    "I'm having trouble retrieving this information right now. "
+    "Please reach out to us on Tel: +256 414 332700 or Toll free line: 0800132700 to be helped. "
+    "Please try again in a moment."
 )
 
 
