@@ -52,13 +52,43 @@ def _is_greeting(message: str) -> bool:
 def _is_memory_question(message: str) -> bool:
     """Recognize a visitor asking whether Mia remembers them.
 
-    This is handled deterministically so personal identity never needs to be
-    sent to the language model or reconstructed from conversation history.
+    This is handled deterministically so personal identity never needs to
+    be sent to the language model or reconstructed from conversation history.
     """
     m = (message or "").strip().lower()
     return bool(
         re.search(r"\b(do you still remember me|do you remember me|remember me|know my name)\b", m)
     )
+
+
+def _random_greeting(name: str | None = None) -> str:
+    """Return a varied greeting string from a curated list.
+    
+    Keeps the bot's opening tone fresh across sessions without
+    altering any logic or guardrails. Includes user name when available.
+    For new users (no name), avoids "Welcome back" phrasing.
+    """
+    # Treat empty string as None
+    if not name:
+        name = None
+    if name:
+        GREETING_VARIANTS = [
+            f"Great to see you, {name}! How can I assist?",
+            f"Welcome back, {name}! What can I help you with today?",
+            f"Hi {name}! What's on your mind?",
+            f"Good to see you again, {name}! What can I do for you?",
+            f"Hey {name}! What's on your mind?",
+        ]
+    else:
+        # For new users: no "Welcome back" phrasing
+        GREETING_VARIANTS = [
+            "Great to see you! How can I assist?",
+            "Hi there! What's on your mind?",
+            "Good to see you! What can I do for you?",
+            "Hey! What's on your mind?",
+            "Thanks for reaching out! How can I help?",
+        ]
+    return random.choice(GREETING_VARIANTS)
 
 
 def _identity_question_kind(message: str) -> str | None:
@@ -88,14 +118,15 @@ def _identity_question_kind(message: str) -> str | None:
 # the user record and used for follow-up only.
 # --------------------------------------------------------------------------- #
 CLIENT_NAME_MASK = ":clients_name"
+import random
 
 IDENTITY_ASK_PROMPT = (
     "{time_greeting}, I'm Mia, your Old Mutual assistant. Could you share your email address "
     "so I can know you better and follow up with you if needed?"
 )
 IDENTITY_ASK_EMAIL_PROMPT = "Thanks! Could you also share your email address so we can follow up with you?"
-IDENTITY_CONFIRMED_PROMPT = "{time_greeting} Thank you! Noted. How can I help you today?"
-IDENTITY_WELCOME_BACK_PROMPT = "Welcome back, {name}! How can I help you today?"
+IDENTITY_CONFIRMED_PROMPT = _random_greeting()
+IDENTITY_WELCOME_BACK_PROMPT = _random_greeting()
 ASSISTANT_IDENTITY_PROMPT = (
     "I'm Mia, your Old Mutual Uganda virtual assistant. I can help with our products, "
     "coverage, benefits, quotes, and support."
@@ -2319,19 +2350,40 @@ class ConversationalMode:
                         f"{ASSISTANT_IDENTITY_PROMPT} {USER_IDENTITY_UNKNOWN_PROMPT}",
                         "combined_identity",
                     )
-                if user is not None and (getattr(user, "email", None) or "").strip() and (_is_greeting(message) or _is_memory_question(message) or identity_kind == "user"):
+                # Handle memory questions first - they need a specific "You're {name}..." response with intent "greeting_returning"
+                if user is not None and (getattr(user, "email", None) or "").strip() and _is_memory_question(message):
                     if name:
                         return self._identity_response(
                             f"You're {name}. How can I help you today?",
                             "greeting_returning",
                         )
+                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
+
+                # Then handle greetings and identity_kind == "user"
+                if user is not None and (getattr(user, "email", None) or "").strip() and identity_kind == "user":
+                    if name:
+                        return self._identity_response(
+                            f"You're {name}. How can I help you today?",
+                            "greeting_returning",
+                        )
+                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
+
+                # Handle greetings
+                if user is not None and (getattr(user, "email", None) or "").strip() and _is_greeting(message):
+                    if name:
+                        return self._identity_response(
+                            _random_greeting(name),
+                            "greeting_returning",
+                        )
                     return self._identity_response(
-                        f"{time_greeting}! How can I help you today?",
+                        _random_greeting(name),
                         "greeting_returning",
                     )
                 if _is_memory_question(message) or identity_kind == "user":
                     ctx["pending_identity_capture"] = True
                     self.state_manager.update_session(session_id, {"context": ctx})
+                    if name:
+                        return self._identity_response(f"You're {name}.", "identity_check")
                     return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
                 ctx["pending_identity_capture"] = True
                 self.state_manager.update_session(session_id, {"context": ctx})
@@ -2380,7 +2432,7 @@ class ConversationalMode:
                             logger.warning("[identity] failed to record relink event: %s", exc)
                     ctx.pop("pending_identity_capture", None)
                     self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
-                    welcome = IDENTITY_WELCOME_BACK_PROMPT.format(name=canonical_name)
+                    welcome = f"Welcome back, {canonical_name}! How can I help you today?"
                     return self._identity_response(welcome, "identity_relinked")
                 self._save_identity(db, user_id, name, email, conversation_id, via="greeting")
                 ctx.pop("pending_identity_capture", None)
