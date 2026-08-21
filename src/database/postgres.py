@@ -227,6 +227,15 @@ class PostgresDB:
             return None
         return self._users.get(user_id)
 
+    def find_user_by_email(self, email: str) -> Optional[User]:
+        target = (email or "").strip().lower()
+        if not target:
+            return None
+        for user in self._users.values():
+            if (user.email or "").strip().lower() == target:
+                return user
+        return None
+
     def get_user_by_id(self, user_id: str) -> Optional[User]:
         return self._users.get(user_id)
 

@@ -89,7 +89,20 @@ class PostgresDB:
 
     def get_user_by_id(self, user_id: str) -> Optional[User]:
         with self._session() as s:
-            stmt = select(User).where(User.id == user_id)
+            stmt = select(User).where(User.id == str(user_id))
+            return s.execute(stmt).scalar_one_or_none()
+
+    def find_user_by_email(self, email: str) -> Optional[User]:
+        target = (email or "").strip().lower()
+        if not target:
+            return None
+        with self._session() as s:
+            stmt = (
+                select(User)
+                .where(func.lower(func.trim(User.email)) == target)
+                .order_by(User.created_at.asc(), User.id.asc())
+                .limit(1)
+            )
             return s.execute(stmt).scalar_one_or_none()
 
     def list_users(self) -> List[User]:

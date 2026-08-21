@@ -149,3 +149,140 @@ def test_identity_ask_skipped_once_email_known():
     assert resp is not None  # personalized greeting for returning user
     assert resp["intent"] == "greeting_returning"
     assert "Jane" in resp["response"]
+
+
+def test_memory_question_next_day_recalls_name():
+    db = PostgresDB()
+    user = db.get_or_create_user("web-visitor-day1")
+    mode1, sm1 = _make_mode(db, "s1")
+
+    mode1._maybe_handle_identity_capture("hi", "s1", user.id, "conv1", sm1.sessions["s1"], db, 0.0)
+    captured = mode1._maybe_handle_identity_capture(
+        "john.doe@example.com", "s1", user.id, "conv1", sm1.sessions["s1"], db, 0.0
+    )
+    assert captured["intent"] == "identity_captured"
+
+    mode2, sm2 = _make_mode(db, "s2")
+    resp = mode2._maybe_handle_identity_capture(
+        "Do you remember me?", "s2", user.id, "conv2", sm2.sessions["s2"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "greeting_returning"
+    assert "You're John" in resp["response"]
+    assert "I'm Mia" not in resp["response"]
+
+
+def test_whats_my_name_next_day_recalls_name():
+    db = PostgresDB()
+    user = db.get_or_create_user("web-visitor-day2")
+    mode1, sm1 = _make_mode(db, "s1")
+
+    mode1._maybe_handle_identity_capture("hello", "s1", user.id, "conv1", sm1.sessions["s1"], db, 0.0)
+    mode1._maybe_handle_identity_capture(
+        "jane.smith@example.com", "s1", user.id, "conv1", sm1.sessions["s1"], db, 0.0
+    )
+
+    mode2, sm2 = _make_mode(db, "s2")
+    resp = mode2._maybe_handle_identity_capture(
+        "what's my name?", "s2", user.id, "conv2", sm2.sessions["s2"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "greeting_returning"
+    assert "You're Jane" in resp["response"]
+    assert "I'm Mia" not in resp["response"]
+
+
+def test_memory_question_unknown_visitor_prompts_for_email():
+    db = PostgresDB()
+    user = db.get_or_create_user("web-visitor-unknown")
+    mode, sm = _make_mode(db, "s1")
+
+    resp = mode._maybe_handle_identity_capture(
+        "do you remember me?", "s1", user.id, "conv1", sm.sessions["s1"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "identity_check"
+    assert "don't know your name" in resp["response"]
+    assert sm.sessions["s1"]["context"]["pending_identity_capture"] is True
+
+
+def test_email_relinks_to_original_profile_next_day():
+    db = PostgresDB()
+    original = db.get_or_create_user("web-visitor-old")
+    mode1, sm1 = _make_mode(db, "s1")
+    mode1._maybe_handle_identity_capture("hi", "s1", original.id, "conv1", sm1.sessions["s1"], db, 0.0)
+    mode1._maybe_handle_identity_capture(
+        "john.doe@example.com", "s1", original.id, "conv1", sm1.sessions["s1"], db, 0.0
+    )
+
+    fresh = db.get_or_create_user("web-visitor-new")
+    assert fresh.id != original.id
+    mode2, sm2 = _make_mode(db, "s2")
+    mode2._maybe_handle_identity_capture("hi", "s2", fresh.id, "conv2", sm2.sessions["s2"], db, 0.0)
+    resp = mode2._maybe_handle_identity_capture(
+        "john.doe@example.com", "s2", fresh.id, "conv2", sm2.sessions["s2"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "identity_relinked"
+    assert "Welcome back, John" in resp["response"]
+    assert sm2.sessions["s2"]["user_id"] == original.id
+    assert db.get_user_by_id(fresh.id).email is None
+    assert db.get_user_by_id(original.id).email == "john.doe@example.com"
+
+    events = db.get_conversation_events("conv2")
+    relinked = [e for e in events if e.event_type == "identity_relinked"]
+    assert relinked, "expected identity_relinked event"
+
+    followup = mode2._maybe_handle_identity_capture(
+        "do you remember me?",
+        "s2",
+        sm2.sessions["s2"]["user_id"],
+        "conv2",
+        sm2.sessions["s2"],
+        db,
+        0.0,
+    )
+    assert followup["intent"] == "greeting_returning"
+    assert "You're John" in followup["response"]
+
+
+def test_email_link_is_case_insensitive():
+    db = PostgresDB()
+    original = db.get_or_create_user("web-visitor-case-old")
+    db.set_user_identity(original.id, name="John", email="john.doe@example.com")
+
+    fresh = db.get_or_create_user("web-visitor-case-new")
+    mode, sm = _make_mode(db, "s1")
+    mode._maybe_handle_identity_capture("hi", "s1", fresh.id, "conv1", sm.sessions["s1"], db, 0.0)
+    resp = mode._maybe_handle_identity_capture(
+        "John.Doe@Example.com", "s1", fresh.id, "conv1", sm.sessions["s1"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "identity_relinked"
+    assert sm.sessions["s1"]["user_id"] == original.id
+    assert db.get_user_by_id(original.id).email == "john.doe@example.com"
+
+
+def test_new_email_does_not_relink():
+    db = PostgresDB()
+    original = db.get_or_create_user("web-visitor-a")
+    db.set_user_identity(original.id, name="Jane", email="jane@x.com")
+
+    fresh = db.get_or_create_user("web-visitor-b")
+    mode, sm = _make_mode(db, "s1")
+    mode._maybe_handle_identity_capture("hi", "s1", fresh.id, "conv1", sm.sessions["s1"], db, 0.0)
+    resp = mode._maybe_handle_identity_capture(
+        "mary@example.com", "s1", fresh.id, "conv1", sm.sessions["s1"], db, 0.0
+    )
+
+    assert resp is not None
+    assert resp["intent"] == "identity_captured"
+    assert "Welcome back" not in resp["response"]
+    assert sm.sessions["s1"].get("user_id") != original.id
+    assert db.get_user_by_id(fresh.id).email == "mary@example.com"
+    assert db.get_user_by_id(original.id).email == "jane@x.com"

@@ -49,6 +49,37 @@ def _is_greeting(message: str) -> bool:
     return m in {"hi", "hello", "hey", "hey!", "hello!", "hi!", "good morning", "good afternoon", "good evening"}
 
 
+def _is_memory_question(message: str) -> bool:
+    """Recognize a visitor asking whether Mia remembers them.
+
+    This is handled deterministically so personal identity never needs to be
+    sent to the language model or reconstructed from conversation history.
+    """
+    m = (message or "").strip().lower()
+    return bool(
+        re.search(r"\b(do you still remember me|do you remember me|remember me|know my name)\b", m)
+    )
+
+
+def _identity_question_kind(message: str) -> str | None:
+    """Classify identity questions without sending them to the LLM."""
+    m = (message or "").strip().lower()
+    asks_mia = bool(re.search(r"\b(who are you|what are you|tell me about yourself)\b", m))
+    asks_user = bool(
+        re.search(
+            r"\b(who am i|what(?:'s|s| is) my name|what are my names|do you know who i am)\b",
+            m,
+        )
+    )
+    if asks_mia and asks_user:
+        return "both"
+    if asks_mia:
+        return "assistant"
+    if asks_user:
+        return "user"
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Identity capture (greeting flow)
 #
@@ -64,6 +95,14 @@ IDENTITY_ASK_PROMPT = (
 )
 IDENTITY_ASK_EMAIL_PROMPT = "Thanks! Could you also share your email address so we can follow up with you?"
 IDENTITY_CONFIRMED_PROMPT = "{time_greeting} Thank you! Noted. How can I help you today?"
+IDENTITY_WELCOME_BACK_PROMPT = "Welcome back, {name}! How can I help you today?"
+ASSISTANT_IDENTITY_PROMPT = (
+    "I'm Mia, your Old Mutual Uganda virtual assistant. I can help with our products, "
+    "coverage, benefits, quotes, and support."
+)
+USER_IDENTITY_UNKNOWN_PROMPT = (
+    "I don't know your name yet. Please share your email address so I can recognize you next time."
+)
 
 # --------------------------------------------------------------------------- #
 # Conversation completion (goodbye flow)
@@ -2218,25 +2257,43 @@ class ConversationalMode:
             time_greeting = _time_greeting_eat()
 
             if not pending:
+                identity_kind = _identity_question_kind(message)
                 if not _is_greeting(message):
-                    return None
+                    if identity_kind is None and not _is_memory_question(message):
+                        return None
                 user = None
                 if db is not None and hasattr(db, "get_user_by_id"):
                     try:
                         user = db.get_user_by_id(user_id)
                     except Exception:
                         user = None
-                if user is not None and (getattr(user, "email", None) or "").strip():
-                    name = (getattr(user, "name", None) or "").strip()
+                name = (getattr(user, "name", None) or "").strip() if user is not None else ""
+                if identity_kind == "assistant":
+                    return self._identity_response(ASSISTANT_IDENTITY_PROMPT, "assistant_identity")
+                if identity_kind == "both":
                     if name:
                         return self._identity_response(
-                            f"{time_greeting}, {name}! How can I help you today?",
+                            f"I'm Mia, your Old Mutual Uganda virtual assistant. You're {name}.",
+                            "combined_identity",
+                        )
+                    return self._identity_response(
+                        f"{ASSISTANT_IDENTITY_PROMPT} {USER_IDENTITY_UNKNOWN_PROMPT}",
+                        "combined_identity",
+                    )
+                if user is not None and (getattr(user, "email", None) or "").strip() and (_is_greeting(message) or _is_memory_question(message) or identity_kind == "user"):
+                    if name:
+                        return self._identity_response(
+                            f"You're {name}. How can I help you today?",
                             "greeting_returning",
                         )
                     return self._identity_response(
                         f"{time_greeting}! How can I help you today?",
                         "greeting_returning",
                     )
+                if _is_memory_question(message) or identity_kind == "user":
+                    ctx["pending_identity_capture"] = True
+                    self.state_manager.update_session(session_id, {"context": ctx})
+                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
                 ctx["pending_identity_capture"] = True
                 self.state_manager.update_session(session_id, {"context": ctx})
                 _emit_metrics(
@@ -2255,7 +2312,37 @@ class ConversationalMode:
             email = _extract_email(message)
 
             if email:
+                email = email.strip().lower()
                 name = _derive_name_from_email(email)
+                existing = None
+                if db is not None and hasattr(db, "find_user_by_email"):
+                    try:
+                        existing = db.find_user_by_email(email)
+                    except Exception as exc:
+                        logger.warning("[identity] email lookup failed: %s", exc)
+                if existing is not None and str(getattr(existing, "id", "")) != str(user_id):
+                    canonical_id = str(existing.id)
+                    canonical_name = (getattr(existing, "name", None) or "").strip() or name
+                    self._save_identity(
+                        db, canonical_id, canonical_name, email, conversation_id, via="greeting_relink"
+                    )
+                    if db is not None and hasattr(db, "add_conversation_event"):
+                        try:
+                            db.add_conversation_event(
+                                conversation_id=conversation_id,
+                                event_type="identity_relinked",
+                                payload={
+                                    "email": email,
+                                    "name_masked": CLIENT_NAME_MASK,
+                                    "has_name": bool(canonical_name),
+                                },
+                            )
+                        except Exception as exc:
+                            logger.warning("[identity] failed to record relink event: %s", exc)
+                    ctx.pop("pending_identity_capture", None)
+                    self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
+                    welcome = IDENTITY_WELCOME_BACK_PROMPT.format(name=canonical_name)
+                    return self._identity_response(welcome, "identity_relinked")
                 self._save_identity(db, user_id, name, email, conversation_id, via="greeting")
                 ctx.pop("pending_identity_capture", None)
                 self.state_manager.update_session(session_id, {"context": ctx})

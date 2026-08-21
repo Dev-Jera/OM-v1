@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import asyncio
+import secrets
 from difflib import get_close_matches
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ from contextlib import suppress
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from src.chatbot.dependencies import (
     admin_auth_protection,
@@ -38,6 +40,9 @@ from src.chatbot.dependencies import (
     authenticate_admin_credentials,
     create_admin_access_token,
     verify_admin_access_token,
+    create_session_capability,
+    require_session_owner,
+    session_uid_from_token,
 )
 
 from src.chatbot.modes.conversational import ConversationalMode
@@ -68,6 +73,27 @@ from src.integrations.quote_downloads import get_quote_metadata, get_quote_pdf
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class SensitiveDataFilter(logging.Filter):
+    """Redact common credentials and direct identifiers from log messages."""
+    _patterns = (
+        (re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,]+"), r"\1[REDACTED]"),
+        (re.compile(r"(?i)(x-api-key|api_key|access_token|password|secret|refresh_token)\s*[:=]\s*[^\s,]+"), r"\1=[REDACTED]"),
+        (re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "[EMAIL_REDACTED]"),
+        (re.compile(r"\b(?:\+?\d[\d ()-]{8,}\d)\b"), "[PHONE_REDACTED]"),
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for pattern, replacement in self._patterns:
+            message = pattern.sub(replacement, message)
+        record.msg = message
+        record.args = ()
+        return True
+
+
+logging.getLogger().addFilter(SensitiveDataFilter())
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Old Mutual Chatbot API",
@@ -77,13 +103,56 @@ app = FastAPI(
 )
 
 # CORS middleware
+# Keep browser access limited to explicitly configured frontend origins.
+# Configure as a comma-separated list, for example:
+# CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174
+def _cors_allowed_origins() -> list[str]:
+    raw = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+cors_allowed_origins = _cors_allowed_origins()
+if not cors_allowed_origins:
+    raise RuntimeError("CORS_ALLOWED_ORIGINS must be configured.")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=cors_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-API-KEY"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def safe_http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    # Never expose exception text for server errors or known integration failures.
+    if exc.status_code >= 500 or (isinstance(detail, str) and any(word in detail.lower() for word in ("failed:", "error:", "exception:"))):
+        detail = "The request could not be completed."
+    return JSONResponse(status_code=exc.status_code, content={"detail": detail}, headers=exc.headers)
+
+
+class SecurityHeadersAndCSRFMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and (
+            request.cookies.get("om_chat_session") or request.cookies.get("om_admin_session")
+        ):
+            origin = request.headers.get("origin")
+            if origin and origin.rstrip("/") not in cors_allowed_origins:
+                return JSONResponse(status_code=403, content={"detail": "CSRF origin rejected"})
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self'")
+        if request.url.scheme == "https":
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+
+app.add_middleware(SecurityHeadersAndCSRFMiddleware)
 
 # ============================================================================
 # DEPENDENCY INJECTION
@@ -731,12 +800,15 @@ class SerenicareFullFormResponse(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier (e.g. phone number or auth id)")
+    # Kept optional for backwards compatibility. Browser identity is taken from
+    # the server-issued visitor cookie, never from this client-controlled field.
+    user_id: Optional[str] = Field(default=None, description="Legacy client identifier (ignored for browser sessions)")
 
 
 class CreateSessionResponse(BaseModel):
     session_id: str
     user_id: str
+    name: Optional[str] = None
 
 
 class StartGuidedRequest(BaseModel):
@@ -791,7 +863,17 @@ async def admin_login(body: AdminLoginRequest):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     token_payload = create_admin_access_token(email)
-    return {**token_payload, "email": email}
+    response = JSONResponse(content={**token_payload, "email": email})
+    response.set_cookie(
+        key="om_admin_session",
+        value=token_payload["access_token"],
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"},
+        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        max_age=_token_ttl_minutes() * 60 if "_token_ttl_minutes" in globals() else 28800,
+        path="/",
+    )
+    return response
 
 
 @api_router.get("/auth/me", tags=["Auth"])
@@ -1686,6 +1768,13 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
         existing_session = state_manager.get_session(session_id)
         if not existing_session:
             session_id = state_manager.create_session(internal_user_id)
+        else:
+            # Server-authoritative identity: an existing session always belongs
+            # to the user it was created (or re-linked) for. Client-supplied
+            # user_id values are never authoritative mid-session.
+            session_owner = str(existing_session.get("user_id") or "").strip()
+            if session_owner:
+                internal_user_id = session_owner
 
     response = await router.route(
         message=request.message or "",
@@ -1815,23 +1904,30 @@ async def get_general_information(
 @api_router.post("/session", response_model=CreateSessionResponse, tags=["Sessions"])
 async def create_session(
     body: CreateSessionRequest,
+    request: Request,
+    response: Response,
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        user = db.get_or_create_user(phone_number=body.user_id)
+        visitor_id = request.cookies.get("om_visitor_id") or f"web-visitor-{secrets.token_urlsafe(24)}"
+        user = db.get_or_create_user(phone_number=visitor_id)
         session_id = state_manager.create_session(str(user.id))
-        return CreateSessionResponse(session_id=session_id, user_id=body.user_id)
+        response.set_cookie("om_chat_session", create_session_capability(session_id, str(user.id)), httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=2592000, path="/")
+        response.set_cookie("om_visitor_id", visitor_id, httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=31536000, path="/")
+        display_name = (getattr(user, "name", None) or "").strip() or None
+        return CreateSessionResponse(session_id=session_id, user_id=visitor_id, name=display_name)
     except Exception as e:
         logger.error(f"Error creating session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @api_router.get("/session/{session_id}")
-async def get_session_state(session_id: str):
+async def get_session_state(session_id: str, request: Request):
     try:
         session = state_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        require_session_owner(request, session_id, session)
 
         step = session.get("current_step", 0)
         step_name = None
@@ -1863,9 +1959,11 @@ async def get_session_state(session_id: str):
 
 
 @api_router.get("/forms/draft/{session_id}/{flow_name}", tags=["Forms"])
-async def get_form_draft(session_id: str, flow_name: str):
+async def get_form_draft(session_id: str, flow_name: str, request: Request):
     try:
         draft = state_manager.get_form_draft(session_id, flow_name)
+        session = state_manager.get_session(session_id)
+        require_session_owner(request, session_id, session)
         if not draft:
             raise HTTPException(status_code=404, detail="Draft not found")
         return draft
@@ -1877,8 +1975,9 @@ async def get_form_draft(session_id: str, flow_name: str):
 
 
 @api_router.delete("/forms/draft/{session_id}/{flow_name}", tags=["Forms"])
-async def delete_form_draft(session_id: str, flow_name: str):
+async def delete_form_draft(session_id: str, flow_name: str, request: Request):
     try:
+        require_session_owner(request, session_id, state_manager.get_session(session_id))
         state_manager.clear_form_draft(session_id, flow_name)
         return {"status": "deleted", "session_id": session_id, "flow": flow_name}
     except Exception as e:
@@ -1889,6 +1988,8 @@ async def delete_form_draft(session_id: str, flow_name: str):
 @api_router.post("/chat/start-guided", tags=["Chat"])
 async def start_guided_body(
     body: StartGuidedRequest,
+    http_request: Request,
+    response: Response,
     router: ChatRouter = Depends(get_router),
     db: PostgresDB = Depends(get_db),
 ):
@@ -1898,6 +1999,9 @@ async def start_guided_body(
         internal_user_id = str(user.id)
         if not session_id:
             session_id = state_manager.create_session(internal_user_id)
+            response.set_cookie("om_chat_session", create_session_capability(session_id, internal_user_id), httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=2592000, path="/")
+        else:
+            require_session_owner(http_request, session_id, state_manager.get_session(session_id))
         response = await router.guided.start_flow(
             flow_name=body.flow_name,
             session_id=session_id,
@@ -1924,14 +2028,43 @@ async def start_guided_body(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _refresh_session_cookie(response: Response, http_request: Request, session_id: str) -> None:
+    """Re-issue the session capability cookie when its uid no longer matches
+    the session owner (e.g. after an email-based identity re-link)."""
+    session = state_manager.get_session(session_id)
+    if not session:
+        return
+    owner = str(session.get("user_id") or "").strip()
+    if not owner:
+        return
+    if session_uid_from_token(http_request.cookies.get("om_chat_session")) == owner:
+        return
+    response.set_cookie(
+        "om_chat_session",
+        create_session_capability(session_id, owner),
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"},
+        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        max_age=2592000,
+        path="/",
+    )
+
+
 @api_router.post("/chat/message", response_model=ChatResponse)
 async def api_send_message(
     request: ChatMessage,
+    http_request: Request,
+    response: Response,
     router: ChatRouter = Depends(get_router),
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        return await _handle_chat_message(request, router, db)
+        if request.session_id:
+            require_session_owner(http_request, request.session_id, state_manager.get_session(request.session_id))
+        resp = await _handle_chat_message(request, router, db)
+        if request.session_id:
+            _refresh_session_cookie(response, http_request, request.session_id)
+        return resp
     except FormValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1949,11 +2082,18 @@ async def api_send_message(
 @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
 async def api_chat(
     request: ChatMessage,
+    http_request: Request,
+    response: Response,
     router: ChatRouter = Depends(get_router),
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        return await _handle_chat_message(request, router, db)
+        if request.session_id:
+            require_session_owner(http_request, request.session_id, state_manager.get_session(request.session_id))
+        resp = await _handle_chat_message(request, router, db)
+        if request.session_id:
+            _refresh_session_cookie(response, http_request, request.session_id)
+        return resp
     except FormValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1973,6 +2113,10 @@ async def websocket_chat(websocket: WebSocket):
     from src.chatbot.dependencies import get_api_keys
     import hmac
 
+    origin = (websocket.headers.get("origin") or "").rstrip("/")
+    if origin and origin not in cors_allowed_origins:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
     valid_keys = get_api_keys()
     candidate = (api_key or "").strip()
@@ -2751,11 +2895,12 @@ def _filter_chat_console_queue(queue: List[Dict[str, Any]], status_filter: Optio
 
 
 @api_router.get("/sessions/{session_id}/history", tags=["Sessions"])
-async def get_conversation_history(session_id: str, limit: int = 50):
+async def get_conversation_history(session_id: str, request: Request, limit: int = 50):
     try:
         session = state_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        require_session_owner(request, session_id, session)
         messages = postgres_db.get_conversation_history(session["conversation_id"], limit=limit)
         msg_list = [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp.isoformat()} for msg in reversed(messages)]
         return {"session_id": session_id, "messages": msg_list}
@@ -2955,6 +3100,10 @@ async def websocket_admin_chat_console(websocket: WebSocket):
     from src.chatbot.dependencies import get_api_keys
     import hmac
 
+    origin = (websocket.headers.get("origin") or "").rstrip("/")
+    if origin and origin not in cors_allowed_origins:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
     valid_keys = get_api_keys()
     api_key_candidate = (api_key or "").strip()
@@ -2964,7 +3113,7 @@ async def websocket_admin_chat_console(websocket: WebSocket):
         return
 
     auth_header = (websocket.headers.get("authorization") or "").strip()
-    access_token = websocket.query_params.get("access_token")
+    access_token = websocket.cookies.get("om_admin_session")
     if auth_header.lower().startswith("bearer ") and not access_token:
         access_token = auth_header.split(" ", 1)[1].strip()
 
@@ -3067,8 +3216,9 @@ async def websocket_admin_chat_console(websocket: WebSocket):
 
 
 @api_router.delete("/sessions/{session_id}", tags=["Sessions"])
-async def end_session(session_id: str, ended_by: str = "user"):
+async def end_session(session_id: str, request: Request, ended_by: str = "user"):
     try:
+        require_session_owner(request, session_id, state_manager.get_session(session_id))
         state_manager.end_session(session_id, ended_by=ended_by)
         return {"message": "Session ended successfully"}
     except Exception as e:

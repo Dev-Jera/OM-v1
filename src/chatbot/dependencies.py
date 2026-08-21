@@ -59,6 +59,78 @@ def _token_ttl_minutes() -> int:
         return 480
 
 
+def _session_secret() -> str:
+    return (os.getenv("SESSION_AUTH_SECRET") or _get_admin_secret()).strip()
+
+
+def create_session_capability(session_id: str, user_id: str, ttl_seconds: int = 2592000) -> str:
+    payload = {"sid": str(session_id), "uid": str(user_id), "exp": int(time.time()) + ttl_seconds}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(_session_secret().encode(), raw, hashlib.sha256).digest()
+    return f"{_b64url_encode(raw)}.{_b64url_encode(sig)}"
+
+
+def verify_session_capability(token: str, session_id: str, user_id: str | None = None) -> bool:
+    try:
+        parts = (token or "").split(".", 1)
+        if len(parts) != 2:
+            return False
+        raw = _b64url_decode(parts[0])
+        sig = _b64url_decode(parts[1])
+        expected = hmac.new(_session_secret().encode(), raw, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        payload = json.loads(raw.decode())
+        return int(payload.get("exp", 0)) > int(time.time()) and payload.get("sid") == str(session_id) and (user_id is None or payload.get("uid") == str(user_id))
+    except Exception:
+        return False
+
+
+def require_session_owner(request: Request, session_id: str, session: dict | None = None) -> dict:
+    session = session or {}
+    token = request.cookies.get("om_chat_session") or request.headers.get("X-SESSION-TOKEN")
+    if not verify_session_capability(token or "", session_id, session.get("user_id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session access denied")
+    return session
+
+
+def session_user_id_from_request(request: Request) -> str:
+    token = request.cookies.get("om_chat_session") or request.headers.get("X-SESSION-TOKEN")
+    try:
+        raw, sig = (token or "").split(".", 1)
+        payload_bytes = _b64url_decode(raw)
+        expected = hmac.new(_session_secret().encode(), payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(_b64url_decode(sig), expected):
+            raise ValueError
+        payload = json.loads(payload_bytes.decode())
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            raise ValueError
+        return str(payload["uid"])
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authenticated session required") from exc
+
+
+def session_uid_from_token(token: str | None) -> str | None:
+    """Best-effort uid extraction from a signed session capability token.
+
+    Returns None for missing/invalid/expired tokens instead of raising, so
+    callers can detect owner changes without treating anonymous clients as
+    errors.
+    """
+    try:
+        raw, sig = (token or "").split(".", 1)
+        payload_bytes = _b64url_decode(raw)
+        expected = hmac.new(_session_secret().encode(), payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(_b64url_decode(sig), expected):
+            return None
+        payload = json.loads(payload_bytes.decode())
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            return None
+        return str(payload.get("uid"))
+    except Exception:
+        return None
+
+
 def authenticate_admin_credentials(email: str, password: str) -> bool:
     configured_email = (os.getenv("ADMIN_AUTH_EMAIL") or "omega@oldmutual.co.ug").strip().lower()
     configured_password = (os.getenv("ADMIN_AUTH_PASSWORD") or "omega").strip()
@@ -116,9 +188,10 @@ def _extract_bearer_token(authorization: str | None) -> str | None:
 
 
 async def admin_auth_protection(
+    request: Request,
     authorization: str = Header(default=None, alias="Authorization"),
 ):
-    token = _extract_bearer_token(authorization)
+    token = _extract_bearer_token(authorization) or request.cookies.get("om_admin_session")
     claims = verify_admin_access_token(token or "")
     if not claims:
         raise HTTPException(
