@@ -23,8 +23,13 @@ async def record_metric(
     await db.commit()
 
 
+async def record_source_coverage(db: AsyncSession, score: float, conversation_id: Optional[str] = None):
+    await record_metric(db, "source_coverage", score, conversation_id)
+
+
 async def record_retrieval_accuracy(db: AsyncSession, score: float, conversation_id: Optional[str] = None):
-    await record_metric(db, "retrieval_accuracy", score, conversation_id)
+    # DEPRECATED: Use record_source_coverage instead
+    await record_metric(db, "source_coverage", score, conversation_id)
 
 
 async def record_confidence(db: AsyncSession, conf: float, conversation_id: Optional[str] = None):

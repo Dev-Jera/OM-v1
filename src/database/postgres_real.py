@@ -16,12 +16,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.database.models import (
     Base,
+    Complaint,
     Conversation,
     ConversationEvent,
     EscalationSession,
     Message,
     PaymentAuditEvent,
     PaymentTransaction,
+    ProductLog,
     Quote,
     RAGMetric,
     User,
@@ -428,6 +430,24 @@ class PostgresDB:
             if limit:
                 stmt = stmt.limit(int(limit))
             return list(s.execute(stmt).scalars().all())
+
+    def count_metric_events(
+        self,
+        start: datetime,
+        end: datetime,
+        metric_type: str,
+        conversation_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Count metric events of a specific type in time window."""
+        with self._session() as s:
+            stmt = select(func.count(RAGMetric.id)).where(
+                RAGMetric.metric_type == metric_type,
+                RAGMetric.created_at >= start,
+                RAGMetric.created_at < end,
+            )
+            if conversation_ids:
+                stmt = stmt.where(RAGMetric.conversation_id.in_(conversation_ids))
+            return s.scalar() or 0
 
     def list_escalations(self, start: datetime, end: datetime) -> List[EscalationSession]:
         with self._session() as s:
@@ -989,3 +1009,98 @@ class PostgresDB:
                 "ended_at": rec.ended_at.isoformat() if rec.ended_at else None,
                 "updated_at": rec.updated_at.isoformat() if rec.updated_at else None,
             }
+
+    # ------------------------------------------------------------------ #
+    # Complaints
+    # ------------------------------------------------------------------ #
+    def create_complaint(
+        self,
+        user_id: str,
+        name: str,
+        email: str,
+        category: str,
+        complaint_text: str,
+    ) -> Complaint:
+        with self._session() as s:
+            rec = Complaint(
+                id=str(uuid4()),
+                user_id=str(user_id),
+                name=name,
+                email=email,
+                category=category,
+                complaint=complaint_text,
+            )
+            s.add(rec)
+            s.flush()
+            s.refresh(rec)
+            return rec
+
+    def get_complaint(self, complaint_id: str) -> Optional[Complaint]:
+        with self._session() as s:
+            stmt = select(Complaint).where(Complaint.id == str(complaint_id))
+            return s.execute(stmt).scalar_one_or_none()
+
+    def list_complaints(self, user_id: Optional[str] = None) -> List[Complaint]:
+        with self._session() as s:
+            stmt = select(Complaint)
+            if user_id:
+                stmt = stmt.where(Complaint.user_id == str(user_id))
+            stmt = stmt.order_by(Complaint.created_at.desc())
+            return list(s.execute(stmt).scalars().all())
+
+    def update_complaint(self, complaint_id: str, updates: Dict[str, Any]) -> Optional[Complaint]:
+        with self._session() as s:
+            stmt = select(Complaint).where(Complaint.id == str(complaint_id))
+            rec = s.execute(stmt).scalar_one_or_none()
+            if not rec:
+                return None
+            for k, v in updates.items():
+                if hasattr(rec, k):
+                    setattr(rec, k, v)
+            rec.updated_at = datetime.utcnow()
+            s.add(rec)
+            s.flush()
+            s.refresh(rec)
+            return rec
+
+    # ------------------------------------------------------------------ #
+    # Product logs
+    # ------------------------------------------------------------------ #
+    def log_product_interest(
+        self,
+        conversation_id: str,
+        user_id: str,
+        product_name: str,
+        product_category: str,
+    ) -> ProductLog:
+        with self._session() as s:
+            log = ProductLog(
+                conversation_id=str(conversation_id),
+                user_id=str(user_id),
+                product_name=product_name,
+                product_category=product_category,
+            )
+            s.add(log)
+            s.flush()
+            s.refresh(log)
+            return log
+
+    def get_product_log(self, log_id: str) -> Optional[ProductLog]:
+        with self._session() as s:
+            return s.execute(
+                select(ProductLog).where(ProductLog.id == str(log_id))
+            ).scalar_one_or_none()
+
+    def list_product_logs(self, user_id: Optional[str] = None) -> List[ProductLog]:
+        with self._session() as s:
+            stmt = select(ProductLog)
+            if user_id:
+                stmt = stmt.where(ProductLog.user_id == str(user_id))
+            stmt = stmt.order_by(ProductLog.created_at.desc())
+            return list(s.execute(stmt).scalars().all())
+
+    def get_product_log_by_conversation(self, conversation_id: str) -> Optional[ProductLog]:
+        with self._session() as s:
+            return s.execute(
+                select(ProductLog).where(ProductLog.conversation_id == str(conversation_id))
+            ).scalar_one_or_none()

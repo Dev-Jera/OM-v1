@@ -112,7 +112,7 @@ def seed_demo_data(db: Any, days: int = 30) -> Dict[str, int]:
             created_at=ts,
         )
         db.add_rag_metric(
-            metric_type="retrieval_accuracy",
+            metric_type="source_coverage",
             value=round(random.uniform(0.7, 0.98), 4),
             conversation_id=conversation_id,
             created_at=ts,
@@ -149,6 +149,10 @@ def seed_demo_data(db: Any, days: int = 30) -> Dict[str, int]:
         elif outcome_roll < 0.90:
             db.add_rag_metric(
                 metric_type="unanswered_questions", value=1.0,
+                conversation_id=conversation_id, created_at=ts,
+            )
+            db.add_rag_metric(
+                metric_type="fallbacks", value=1.0,
                 conversation_id=conversation_id, created_at=ts,
             )
             db.add_conversation_event(

@@ -117,11 +117,29 @@ class ChatRouter:
                 }
 
             if action in ("get_quotation", "get_quote"):
+                # Redirect to main menu instead of starting guided flow
                 ctx = (session.get("context") or {}) if isinstance(session, dict) else {}
                 topic = (ctx.get("product_topic") or {}) if isinstance(ctx, dict) else {}
                 product_flow = topic.get("digital_flow")
-                initial_data = {"product_flow": product_flow} if product_flow else None
-                return await self.guided.start_flow("journey", session_id, user_id, initial_data=initial_data)
+                
+                if product_flow:
+                    return {
+                        "mode": "conversational",
+                        "response": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there.",
+                        "suggested_action": {
+                            "type": "redirect_to_main_menu",
+                            "message": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there."
+                        }
+                    }
+                else:
+                    return {
+                        "mode": "conversational",
+                        "response": "To get a quote, please go to the main menu and click 'Get Quote' to select a product and follow the steps.",
+                        "suggested_action": {
+                            "type": "redirect_to_main_menu",
+                            "message": "To get a quote, please go to the main menu and click 'Get Quote' to select a product and follow the steps."
+                        }
+                    }
 
             if action == "start_guided":
                 flow_name = form_data.get("flow") or form_data.get("flow_name") or "journey"
@@ -167,47 +185,32 @@ class ChatRouter:
         return await self.conversational.process(message, session_id, user_id, form_data=form_data, db=db)
 
     def _is_guided_trigger(self, message: str) -> bool:
-        """Check if message should trigger guided flow"""
+        """Check if message should trigger guided flow.
+        Now only triggers for explicit agent/human requests.
+        Quote/quotation requests are handled by redirecting to main menu."""
         message_lower = message.lower()
 
-        # Explicit quotation/application requests
-        explicit_triggers = [
-            "get a quote",
-            "get a quotation",
-            "get quotation",
-            "want a quote",
-            "want a quotation",
-            "want quotation",
-            "need a quote",
-            "need a quotation",
-            "i want to apply",
-            "i want to buy",
-            "i want to purchase",
-            "can i get a quote",
-            "can i get a quotation",
-            "can i get quotation",
-            "give me a quote",
-            "provide a quote",
+        # Only trigger for explicit agent/human requests
+        agent_triggers = [
+            "talk to agent",
+            "speak to agent",
+            "human agent",
+            "connect to agent",
+            "speak to human",
+            "talk to human",
+            "human please",
+            "agent please",
         ]
 
-        if any(trigger in message_lower for trigger in explicit_triggers):
-            logger.info("[Router] Explicit guided trigger matched: %s", message[:100])
-            return True
-
-        wants_quote = any(word in message_lower for word in ["want", "need", "get"]) and any(
-            word in message_lower for word in ["quote", "quotation"]
-        )
-        wants_purchase = any(word in message_lower for word in ["want", "need", "help me", "can i"]) and any(
-            word in message_lower for word in ["apply", "buy", "purchase"]
-        )
-        if wants_quote or wants_purchase:
-            logger.info("[Router] Explicit guided trigger matched by intent words: %s", message[:100])
+        if any(trigger in message_lower for trigger in agent_triggers):
+            logger.info("[Router] Agent request trigger matched: %s", message[:100])
             return True
 
         return False
 
     def _detect_flow_type(self, message: str) -> str:
-        """Detect which guided flow to start"""
+        """Detect which guided flow to start.
+        Quote/quotation requests now return 'discovery' to redirect to main menu."""
         message_lower = message.lower()
 
         # Personal Accident: apply, buy, get cover for personal accident
@@ -246,9 +249,9 @@ class ChatRouter:
         ):
             return "serenicare"
 
-        # Quote/buy triggers
+        # Quote/buy triggers - now return 'discovery' to redirect to main menu
         if any(word in message_lower for word in ["quote", "how much", "price", "cost"]):
-            return "quotation"
+            return "discovery"
 
         # Discovery triggers
         if any(word in message_lower for word in ["help me choose", "recommend", "which"]):

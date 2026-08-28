@@ -49,6 +49,13 @@ def main() -> int:
         help="Day to push as YYYY-MM-DD (default: today UTC). Useful for backfill.",
     )
     parser.add_argument("--module", type=str, default=None, help="CRM module name (default: ZOHO_METRICS_MODULE or Mia_Bot_Metrics)")
+    parser.add_argument(
+        "--period",
+        type=str,
+        choices=["daily", "hourly"],
+        default="daily",
+        help="daily = one record per calendar day; hourly = rolling-24h snapshot for the current hour",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -71,17 +78,21 @@ def main() -> int:
             log.error("--date must be YYYY-MM-DD, got %r", args.date)
             return 1
 
-    from src.integrations.zoho.push_metrics import push_day
+    from src.integrations.zoho.push_metrics import push_day, push_hour
 
     try:
         db = _build_db()
-        result = push_day(db, day=day, module=args.module)
+        if args.period == "hourly":
+            result = push_hour(db, module=args.module)
+        else:
+            result = push_day(db, day=day, module=args.module)
     except Exception as e:  # noqa: BLE001 - CLI surface
         log.error("%s: %s", type(e).__name__, e)
         return 1
     log.info(
-        "Zoho metrics push complete for %s: %s conversations, resolution %s%%, csat %s",
+        "Zoho metrics push complete for %s%s: %s conversations, resolution %s%%, csat %s",
         result["date"],
+        f" hour {result.get('hour')}" if result.get("hour") is not None else "",
         result["record"].get("Conversations"),
         result["record"].get("Resolution_Rate"),
         result["record"].get("CSAT"),

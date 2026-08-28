@@ -218,14 +218,11 @@ async def api_key_protection(
         return
 
     valid_keys = get_api_keys()
-    query_api_key = ""
     header_api_key = (x_api_key or "").strip()
     if active_scope is not None:
-        query_api_key = str(active_scope.query_params.get("api_key") or "").strip()
-        if not header_api_key:
-            header_api_key = str(active_scope.headers.get("x-api-key") or "").strip()
+        header_api_key = str(active_scope.headers.get("x-api-key") or "").strip()
 
-    candidate = header_api_key or query_api_key
+    candidate = header_api_key
 
     ok = bool(candidate) and any(hmac.compare_digest(candidate, k) for k in valid_keys)
     if debug:

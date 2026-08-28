@@ -121,6 +121,31 @@ class GuidedMode:
         except Exception:
             pass
 
+        # Log product interest for guided flows (first mention only).
+        _PRODUCT_FLOW_MAP = {
+            "personal_accident": ("Personal Accident", "personal"),
+            "travel_insurance": ("Travel Insurance", "personal"),
+            "motor_private": ("Motor Private", "vehicle"),
+            "serenicare": ("Serenicare", "personal"),
+        }
+        if flow_name in _PRODUCT_FLOW_MAP:
+            try:
+                product_name, product_category = _PRODUCT_FLOW_MAP[flow_name]
+                db_guided = getattr(self.state_manager, "db", None)
+                if db_guided and hasattr(db_guided, "log_product_interest"):
+                    ctx = dict(session.get("context") or {})
+                    if not ctx.get("product_logged"):
+                        db_guided.log_product_interest(
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            product_name=product_name,
+                            product_category=product_category,
+                        )
+                        ctx["product_logged"] = True
+                        self.state_manager.update_session(session_id, {"context": ctx})
+            except Exception:
+                pass
+
         # Switch to guided mode
         self.state_manager.switch_mode(session_id, "guided", flow=flow_name)
 

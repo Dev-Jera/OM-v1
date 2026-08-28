@@ -8,7 +8,8 @@ instance.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class RedisCache:
@@ -64,3 +65,15 @@ class RedisCache:
         Redis as "connected" in local/dev mode.
         """
         return True
+
+    def count_metric_events(
+        self,
+        start: datetime,
+        end: datetime,
+        metric_type: str,
+        conversation_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Count metric events of a specific type in time window.
+        Stub implementation for local development - always returns 0.
+        """
+        return 0

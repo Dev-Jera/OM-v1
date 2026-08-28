@@ -1,8 +1,54 @@
+import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from src.chatbot.state_manager import StateManager
+
+
+def _resolve_general_info_file(product: str, product_dir: Path) -> Optional[Path]:
+    """Resolve the general info JSON file for a given product key."""
+    normalized = product.lower().replace(" ", "-").replace("_", "-")
+    if not normalized or not product_dir.exists():
+        return None
+
+    candidate_files = sorted(product_dir.glob("*.json"))
+
+    def _load_info(path: Path) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        return data
+
+    # 1) exact filename/display-name matches
+    for path in candidate_files:
+        if normalized in {
+            path.stem.lower(),
+            path.stem.lower().replace("-", " ").replace("_", " "),
+        }:
+            return path
+
+    # 2) fuzzy match against product_id / title inside JSON
+    for path in candidate_files:
+        info = _load_info(path)
+        pid = str(info.get("product_id") or "").lower()
+        title = str(info.get("title") or "").lower()
+        if pid and normalized in pid:
+            return path
+        if title and normalized in title:
+            return path
+
+    # 3) fallback: substring match on filename stem
+    for path in candidate_files:
+        if normalized in path.stem.lower():
+            return path
+
+    return None
 
 router = APIRouter()
 
@@ -27,9 +73,38 @@ class EndEscalationRequest(BaseModel):
 
 
 @router.post("/escalate")
-async def escalate(body: EscalateRequest):
+async def escalate(body: EscalateRequest, request: Request = None):
     if not body.session_id:
         return {"success": False, "error": "Missing session_id"}
+
+    # Session ownership check (defense-in-depth for frontend calls).
+    # Zoho webhooks don't carry session tokens, so we only enforce when a
+    # token is present.
+    if request is not None:
+        token = request.cookies.get("om_chat_session") or request.headers.get("X-SESSION-TOKEN")
+        if token:
+            session = state_manager.get_session(body.session_id) or {}
+            from src.chatbot.dependencies import verify_session_capability
+            if not verify_session_capability(token, body.session_id, session.get("user_id")):
+                return {"success": False, "error": "Session access denied"}
+
+    metadata = body.metadata or {}
+
+    # If this is a non-routed general info escalation, attach full product JSON
+    if body.reason == "general_info_non_routed" and body.metadata and body.metadata.get("product"):
+        product_key = body.metadata["product"]
+        try:
+            BASE_DIR = Path(__file__).resolve().parents[1]
+            PRODUCT_DIR = BASE_DIR / "general_information" / "product_json"
+            product_file = _resolve_general_info_file(product_key, PRODUCT_DIR)
+            if product_file and product_file.exists():
+                with open(product_file, "r", encoding="utf-8") as f:
+                    full_product_json = json.load(f)
+                metadata["full_product_json"] = full_product_json
+        except Exception:
+            # Silently continue if we can't load the JSON
+            pass
+
     # Route through EscalationService so every escalation path (endpoint,
     # button, chat trigger) also fires the Zoho handoff hook.
     from src.integrations.policy.escalation_service import EscalationService
@@ -37,7 +112,7 @@ async def escalate(body: EscalateRequest):
     EscalationService(state_manager=state_manager).escalate_to_human(
         session_id=body.session_id,
         reason=body.reason or "customer_requested_agent",
-        metadata=body.metadata or {},
+        metadata=metadata,
     )
     state = state_manager.get_escalation_state(body.session_id)
     # Path attribution: a direct /escalate call means the user chose a human agent.
@@ -75,11 +150,48 @@ async def agent_join(body: AgentJoinRequest):
 
 
 @router.post("/escalate/end")
-async def end_escalation(body: EndEscalationRequest):
+async def end_escalation(body: EndEscalationRequest, request: Request = None):
     if not body.session_id:
         return {"success": False, "error": "Missing session_id"}
+
+    # Session ownership check (defense-in-depth for frontend calls).
+    if request is not None:
+        token = request.cookies.get("om_chat_session") or request.headers.get("X-SESSION-TOKEN")
+        if token:
+            session = state_manager.get_session(body.session_id) or {}
+            from src.chatbot.dependencies import verify_session_capability
+            if not verify_session_capability(token, body.session_id, session.get("user_id")):
+                return {"success": False, "error": "Session access denied"}
+
     state = state_manager.end_escalation(body.session_id)
     return {"success": True, "escalated": False, "state": state}
+
+
+@router.post("/escalate/timeout")
+async def escalation_timeout(body: EscalateRequest):
+    """Called when Zoho operator times out (30s)"""
+    if not body.session_id:
+        return {"success": False, "error": "Missing session_id"}
+    state_manager.mark_escalated(body.session_id, reason="operator_timeout")
+    return {"success": True}
+
+
+@router.post("/escalate/offline")
+async def escalation_offline(body: EscalateRequest):
+    """Called when no operators are online"""
+    if not body.session_id:
+        return {"success": False, "error": "Missing session_id"}
+    state_manager.mark_escalated(body.session_id, reason="offline")
+    return {"success": True}
+
+
+@router.post("/escalate/invalid")
+async def escalation_invalid(body: EscalateRequest):
+    """Called when operator connection is invalid"""
+    if not body.session_id:
+        return {"success": False, "error": "Missing session_id"}
+    state_manager.mark_escalated(body.session_id, reason="invalid_config")
+    return {"success": True}
 
 
 @router.get("/escalate/{session_id}")

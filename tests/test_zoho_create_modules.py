@@ -43,9 +43,11 @@ def test_expected_api_names_match_label_derivation():
 def test_metrics_fields_cover_everything_push_writes():
     from src.integrations.zoho.push_metrics import impact_payload_to_crm_record
 
-    record = impact_payload_to_crm_record({}, "2026-08-18")
+    daily = impact_payload_to_crm_record({}, "2026-08-18")
+    hourly = impact_payload_to_crm_record({}, "2026-08-18", metric_hour=14)
     expected = FIELD_API_NAMES["Mia_Bot_Metrics"]
-    assert sorted(record.keys()) == sorted(expected)
+    # Daily rows omit Metric_Hour; hourly rows include it. Together they cover all documented fields.
+    assert sorted(set(daily) | set(hourly)) == sorted(expected)
 
 
 def test_escalation_fields_cover_everything_push_writes():

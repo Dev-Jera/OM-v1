@@ -145,6 +145,31 @@ class EscalationSession:
 
 
 @dataclass
+class Complaint:
+    id: str
+    user_id: str
+    name: str
+    email: str
+    category: str
+    complaint: str
+    status: str = "submitted"
+    zoho_record_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class ProductLog:
+    id: str
+    conversation_id: str
+    user_id: str
+    product_name: str
+    product_category: str
+    zoho_record_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
 class PaymentTransaction:
     reference: str
     provider: str
@@ -197,6 +222,10 @@ class PostgresDB:
         self._payment_audit_events: List[PaymentAuditEvent] = []
         # RAG metrics
         self._rag_metrics: List[RAGMetric] = []
+        # Complaints
+        self._complaints: Dict[str, Complaint] = {}
+        # Product logs
+        self._product_logs: Dict[str, ProductLog] = {}
 
     # ------------------------------------------------------------------ #
     # Schema / lifecycle
@@ -418,6 +447,25 @@ class PostgresDB:
         if limit:
             metrics = metrics[: int(limit)]
         return metrics
+
+    def count_metric_events(
+        self,
+        start: datetime,
+        end: datetime,
+        metric_type: str,
+        conversation_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Count metric events of a specific type in time window."""
+        count = 0
+        for m in self._rag_metrics:
+            if m.metric_type != metric_type:
+                continue
+            if not (start <= m.created_at < end):
+                continue
+            if conversation_ids and m.conversation_id not in conversation_ids:
+                continue
+            count += 1
+        return count
 
     def list_escalations(self, start: datetime, end: datetime) -> List[EscalationSession]:
         def _ts(rec: EscalationSession) -> datetime:
@@ -881,3 +929,81 @@ class PostgresDB:
         rec.ended_at = now
         rec.updated_at = now
         return self.get_escalation_state(session_id) or {}
+
+    # ------------------------------------------------------------------ #
+    # Complaints
+    # ------------------------------------------------------------------ #
+    def create_complaint(
+        self,
+        user_id: str,
+        name: str,
+        email: str,
+        category: str,
+        complaint_text: str,
+    ) -> Complaint:
+        complaint = Complaint(
+            id=str(uuid.uuid4()),
+            user_id=str(user_id),
+            name=name,
+            email=email,
+            category=category,
+            complaint=complaint_text,
+        )
+        self._complaints[complaint.id] = complaint
+        return complaint
+
+    def get_complaint(self, complaint_id: str) -> Optional[Complaint]:
+        return self._complaints.get(str(complaint_id))
+
+    def list_complaints(self, user_id: Optional[str] = None) -> List[Complaint]:
+        items = list(self._complaints.values())
+        if user_id:
+            items = [c for c in items if c.user_id == str(user_id)]
+        items.sort(key=lambda c: c.created_at, reverse=True)
+        return items
+
+    def update_complaint(self, complaint_id: str, updates: Dict[str, Any]) -> Optional[Complaint]:
+        complaint = self._complaints.get(str(complaint_id))
+        if not complaint:
+            return None
+        for k, v in updates.items():
+            if hasattr(complaint, k):
+                setattr(complaint, k, v)
+        complaint.updated_at = datetime.utcnow()
+        return complaint
+
+    # ------------------------------------------------------------------ #
+    # Product logs
+    # ------------------------------------------------------------------ #
+    def log_product_interest(
+        self,
+        conversation_id: str,
+        user_id: str,
+        product_name: str,
+        product_category: str,
+    ) -> ProductLog:
+        log = ProductLog(
+            id=str(uuid.uuid4()),
+            conversation_id=str(conversation_id),
+            user_id=str(user_id),
+            product_name=product_name,
+            product_category=product_category,
+        )
+        self._product_logs[log.id] = log
+        return log
+
+    def get_product_log(self, log_id: str) -> Optional[ProductLog]:
+        return self._product_logs.get(str(log_id))
+
+    def list_product_logs(self, user_id: Optional[str] = None) -> List[ProductLog]:
+        items = list(self._product_logs.values())
+        if user_id:
+            items = [p for p in items if p.user_id == str(user_id)]
+        items.sort(key=lambda p: p.created_at, reverse=True)
+        return items
+
+    def get_product_log_by_conversation(self, conversation_id: str) -> Optional[ProductLog]:
+        for log in self._product_logs.values():
+            if log.conversation_id == str(conversation_id):
+                return log
+        return None

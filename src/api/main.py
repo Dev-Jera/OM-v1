@@ -4,6 +4,10 @@ load_dotenv()
 
 from src.api.escalation import router as escalation_router
 from src.api.admin_pipelines import router as admin_pipelines_router
+from src.api.complaints import router as complaints_router
+import src.api.complaints as complaints_module
+from src.api.product_logs import router as product_logs_router
+import src.api.product_logs as product_logs_module
 from src.api.endpoints.payments import payments_api
 from src.api.endpoints.policies import policies_api
 from src.api.endpoints.premiums import premiums_api
@@ -26,7 +30,7 @@ from difflib import get_close_matches
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from collections import defaultdict, Counter
 from contextlib import suppress
 
@@ -66,6 +70,7 @@ from src.utils.product_matcher import ProductMatcher
 from src.utils.rag_config_loader import load_rag_config
 from src.utils.runtime_env import runtime_service_summary, should_use_real_postgres, should_use_real_redis
 from src.utils.pii_redaction import redact_text
+from src.utils.identity import extract_email, extract_name_from_email, is_valid_email
 from src.api.validate_flow import router as validate_flow_router
 from src.integrations.quote_downloads import get_quote_metadata, get_quote_pdf
 
@@ -183,6 +188,14 @@ state_manager = StateManager(redis_cache, postgres_db)
 escalation_module.state_manager = state_manager
 # Register escalation router
 app.include_router(escalation_router, prefix="/api/v1")
+
+# Register complaints router
+complaints_module.db = postgres_db
+app.include_router(complaints_router, prefix="/api/v1")
+
+# Register product logs router
+product_logs_module.db = postgres_db
+app.include_router(product_logs_router, prefix="/api/v1")
 
 # Register payments API router
 app.include_router(payments_api, prefix="/api/v1/payments", tags=["Payments"])
@@ -811,6 +824,19 @@ class CreateSessionResponse(BaseModel):
     name: Optional[str] = None
 
 
+class IdentifyRequest(BaseModel):
+    email: str = Field(..., description="User email address")
+    session_id: Optional[str] = Field(None, description="Existing session to link")
+
+
+class IdentifyResponse(BaseModel):
+    session_id: str
+    user_id: str
+    name: Optional[str] = None
+    is_new_user: bool
+    message: str
+
+
 class StartGuidedRequest(BaseModel):
     flow_name: str = Field(..., description="Flow id, e.g. 'personal_accident'")
     user_id: str
@@ -1038,7 +1064,7 @@ async def get_ai_performance_metrics(
             start=start,
             end=end,
             metric_types=[
-                "retrieval_accuracy",
+                "source_coverage",
                 "confidence_score",
                 "response_latency",
             ],
@@ -1048,7 +1074,7 @@ async def get_ai_performance_metrics(
         for m in rag:
             by_type[m.metric_type].append(float(m.value))
 
-        accuracy = _avg(by_type["retrieval_accuracy"]) * 100
+        source_coverage = _avg(by_type["source_coverage"]) * 100
         confidence = _avg(by_type["confidence_score"]) * 100
         latency = _avg(by_type["response_latency"])
 
@@ -1087,7 +1113,7 @@ async def get_ai_performance_metrics(
         bot_down_rate = _rate(bot_down, conversations)
 
         return {
-            "accuracy": accuracy,
+            "source_coverage": source_coverage,
             "confidence": confidence,
             "latency": latency,
             "fallback_rate": fallback_rate,
@@ -1204,7 +1230,7 @@ async def get_ai_performance_metrics(
     trend_metrics = db.list_rag_metrics(
         start=trend_start,
         end=now,
-        metric_types=["retrieval_accuracy", "fallbacks", "confidence_score"],
+        metric_types=["source_coverage", "fallbacks", "confidence_score"],
         limit=50000,
     )
     trend_by_day: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
@@ -1215,12 +1241,12 @@ async def get_ai_performance_metrics(
     trend_data = []
     for i in range(trend_days):
         day = (trend_start + timedelta(days=i)).strftime("%a")
-        acc = _avg(trend_by_day[day]["retrieval_accuracy"]) * 100
+        coverage = _avg(trend_by_day[day]["source_coverage"]) * 100
         responses = len(trend_by_day[day]["confidence_score"])
         fallbacks = len(trend_by_day[day]["fallbacks"])
         fallback_rate = _rate(fallbacks, responses)
         trend_data.append(
-            {"day": day, "accuracy": round(acc, 1), "fallback": round(fallback_rate, 1)}
+            {"day": day, "source_coverage": round(coverage, 1), "fallback": round(fallback_rate, 1)}
         )
 
     # Conversation quality metrics
@@ -1452,22 +1478,22 @@ async def get_ai_performance_metrics(
             }
         )
 
-    # RAG retrieval performance
+# RAG retrieval performance
     rag_metrics = db.list_rag_metrics(
         start=current_start,
         end=now,
-        metric_types=["retrieval_accuracy", "confidence_score", "response_latency", "fallbacks"],
+        metric_types=["source_coverage", "confidence_score", "response_latency", "fallbacks"],
         limit=50000,
     )
     rag_by_type: Dict[str, List[float]] = defaultdict(list)
     for m in rag_metrics:
         rag_by_type[m.metric_type].append(float(m.value))
-    retrieval_success = _avg(rag_by_type["retrieval_accuracy"]) * 100
+    source_coverage_success = _avg(rag_by_type["source_coverage"]) * 100
     avg_latency_ms = _avg(rag_by_type["response_latency"]) * 1000
     doc_relevance = _avg(rag_by_type["confidence_score"])
-
+    
     rag_context_rows = [
-        {"doc": "Retrieval Accuracy", "accuracy": _fmt_pct(retrieval_success, 1)},
+        {"doc": "Source Coverage", "accuracy": _fmt_pct(source_coverage_success, 1)},
         {"doc": "Confidence Score", "accuracy": _fmt_pct(doc_relevance * 100, 1)},
         {"doc": "Fallback Rate", "accuracy": _fmt_pct(current["fallback_rate"], 1)},
     ]
@@ -1844,14 +1870,58 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
     return ChatResponse(response=response, session_id=session_id, mode=response.get("mode", "conversational"), timestamp=datetime.now().isoformat())
 
 
+# Section order for progressive disclosure
+SECTION_ORDER = [
+    "definition",
+    "eligibility",
+    "benefits",
+    "exclusions",
+    "requirements",
+    "important_notes",
+]
+
+PRODUCTS_WITH_BUY_ROUTE = {
+    "personal_accident",
+    "serenicare",
+    "motor_private",
+    "travel",
+}
+
+CONTACT_NUMBERS = {
+    "tel": "+256 414 332700",
+    "toll_free": "0800132700",
+}
+
+DISCLAIMER_NON_ROUTED = (
+    "For the most up-to-date information, let me connect you with an agent."
+)
+
+def _get_product_has_buy_route(product_id: str) -> bool:
+    """Check if product has a buy route."""
+    return product_id in PRODUCTS_WITH_BUY_ROUTE
+
+
+def _get_next_section(current: str, available: set[str]) -> Optional[str]:
+    """Get the next available section in order."""
+    try:
+        idx = SECTION_ORDER.index(current)
+        for next_key in SECTION_ORDER[idx + 1:]:
+            if next_key in available:
+                return next_key
+    except ValueError:
+        pass
+    return None
+
+
 @api_router.get("/general-information", tags=["General Information"])
 async def get_general_information(
     request: Request,
     product: str,
+    section: Optional[str] = Query(None),
     redis=Depends(get_redis)
 ):
     logger = logging.getLogger("general_information")
-    logger.info(f"General info request: product={product}")
+    logger.info(f"General info request: product={product}, section={section}")
 
     try:
         BASE_DIR = Path(__file__).resolve().parents[2]
@@ -1876,19 +1946,64 @@ async def get_general_information(
         if not isinstance(info, dict):
             raise HTTPException(status_code=500, detail="Invalid product information format")
 
+        product_id = info.get("product_id") or product_file.stem
+        title = info.get("title") or product_file.stem.replace("-", " ").replace("_", " ").title()
+        has_buy_route = _get_product_has_buy_route(product_id)
+
+        # Build all available sections
+        sections = _build_general_info_sections(info)
+        available_sections = {s["heading"].lower(): s for s in sections}
+        available_keys = set(available_sections.keys())
+
+        # If section parameter provided, return single section with navigation
+        if section:
+            section_key = section.lower()
+            if section_key not in available_sections:
+                raise HTTPException(status_code=404, detail="Section not found")
+
+            current_section = available_sections[section_key]
+            next_section_key = _get_next_section(section_key, available_keys)
+            has_next = next_section_key is not None
+            is_last = not has_next
+
+            response_data = {
+                "product_id": product_id,
+                "title": title,
+                "current_section": {
+                    "heading": current_section["heading"],
+                    "content": current_section["content"],
+                    "content_type": current_section["content_type"],
+                },
+                "next_section": next_section_key,
+                "has_next": has_next,
+                "is_last": is_last,
+            }
+
+            if is_last:
+                response_data["has_buy_route"] = has_buy_route
+                response_data["contact_numbers"] = CONTACT_NUMBERS
+                if not has_buy_route:
+                    response_data["disclaimer"] = (
+                        "For the most up-to-date information, let me connect you with an agent."
+                    )
+
+            logger.info("General info section served: product=%s, section=%s", product, section)
+            return JSONResponse(content=response_data)
+
+        # No section requested - return full response (backward compatibility)
         normalized_response = {
-            "product_id": info.get("product_id") or product_file.stem,
-            "title": info.get("title") or product_file.stem.replace("-", " ").replace("_", " ").title(),
+            "product_id": product_id,
+            "title": title,
             "definition": info.get("definition") or "",
             "benefits": info.get("benefits") or [],
             "eligibility": info.get("eligibility") or "",
             "source_url": info.get("source_url") or "",
         }
 
-        sections = _build_general_info_sections(info)
-        normalized_response["sections"] = sections
+        sections_list = _build_general_info_sections(info)
+        normalized_response["sections"] = sections_list
         normalized_response["readable_text"] = _build_general_info_readable_text(
-            normalized_response["title"], sections
+            title, sections_list
         )
 
         logger.info("General info served for product=%s via file=%s", product, product_file.name)
@@ -1918,6 +2033,78 @@ async def create_session(
         return CreateSessionResponse(session_id=session_id, user_id=visitor_id, name=display_name)
     except Exception as e:
         logger.error(f"Error creating session: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/session/identify", response_model=IdentifyResponse, tags=["Sessions"])
+async def identify_session(
+    body: IdentifyRequest,
+    request: Request,
+    response: Response,
+    db: PostgresDB = Depends(get_db),
+):
+    try:
+        email = body.email.strip().lower()
+        if not is_valid_email(email):
+            raise HTTPException(status_code=400, detail="Invalid email format")
+
+        session_id = body.session_id
+        is_new_user = False
+        user = db.find_user_by_email(email)
+        
+        if user:
+            # Existing user with this email
+            internal_user_id = str(user.id)
+            display_name = (getattr(user, "name", None) or "").strip()
+            if not display_name:
+                display_name = extract_name_from_email(email)
+                db.set_user_identity(user.id, name=display_name, email=email)
+            is_new_user = False
+        else:
+            # New user - create with email-based phone_number
+            display_name = extract_name_from_email(email)
+            email_visitor_id = f"email-{email}"
+            user = db.get_or_create_user(phone_number=email_visitor_id)
+            db.set_user_identity(user.id, name=display_name, email=email)
+            internal_user_id = str(user.id)
+            is_new_user = True
+
+        # Handle session
+        if session_id:
+            # Verify ownership of existing session
+            require_session_owner(request, session_id, state_manager.get_session(session_id))
+            # Update session with new user_id
+            state_manager.update_session(session_id, {"user_id": internal_user_id})
+        else:
+            # Create new session
+            session_id = state_manager.create_session(internal_user_id)
+
+        # Update context with identity info
+        context_updates = {
+            "name": display_name,
+            "email": email,
+            "email_collected": True,
+            "pending_identity_capture": False,
+            "user_id": internal_user_id,
+        }
+        state_manager.update_session(session_id, {"context": context_updates})
+
+        # Refresh cookies with new user_id
+        response.set_cookie("om_chat_session", create_session_capability(session_id, internal_user_id), httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=2592000, path="/")
+        # Optionally update visitor_id to email-based for cross-device (keeping device-based for now)
+        # response.set_cookie("om_visitor_id", f"email-{email}", httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=31536000, path="/")
+
+        return IdentifyResponse(
+            session_id=session_id,
+            user_id=internal_user_id,
+            name=display_name,
+            is_new_user=is_new_user,
+            message="Noted. What are you looking into today? Investment? Life assurance? General insurance? Let me know how I can be of good help."
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error identifying session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2110,7 +2297,7 @@ async def api_chat(
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    from src.chatbot.dependencies import get_api_keys
+    from src.chatbot.dependencies import get_api_keys, verify_session_capability
     import hmac
 
     origin = (websocket.headers.get("origin") or "").rstrip("/")
@@ -2124,6 +2311,9 @@ async def websocket_chat(websocket: WebSocket):
     if not ok:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+
+    # Extract session token from upgrade handshake cookies for ownership checks.
+    session_token = websocket.cookies.get("om_chat_session") or websocket.headers.get("x-session-token")
 
     await websocket.accept()
 
@@ -2141,6 +2331,13 @@ async def websocket_chat(websocket: WebSocket):
         except ValidationError as e:
             await websocket.send_json({"error": "invalid_payload", "details": e.errors()})
             continue
+
+        # Session ownership check (defense-in-depth for frontend calls).
+        if msg.session_id and session_token:
+            session = state_manager.get_session(msg.session_id) or {}
+            if not verify_session_capability(session_token, msg.session_id, session.get("user_id")):
+                await websocket.send_json({"error": "session_access_denied", "detail": "Session access denied"})
+                continue
 
         try:
             resp = await _handle_chat_message(msg, chat_router, postgres_db)
@@ -2992,14 +3189,21 @@ async def admin_sync_zoho(
 @api_router.post("/admin/metrics/push-zoho", tags=["Admin"], dependencies=[Depends(admin_auth_protection)])
 async def admin_metrics_push_zoho(
     date: Optional[str] = Query(default=None, description="Day to push as YYYY-MM-DD (default: today UTC)"),
+    period: Literal["daily", "hourly"] = Query(
+        default="daily", description="'daily' = one record per day; 'hourly' = rolling-24h snapshot for the current hour"
+    ),
     db: PostgresDB = Depends(get_db),
 ):
     """
-    Push one day of Bot Impact KPIs into the Zoho CRM Mia_Bot_Metrics module.
+    Push Bot Impact KPIs into the Zoho CRM Mia_Bot_Metrics module.
 
-    Uses the same KPI math as /metrics/impact. The push is an upsert keyed by
-    Metric_Date, so re-running a day updates instead of duplicating. Gated by
-    ZOHO_SYNC_ENABLED like the product sync.
+    period=daily (default): window = the calendar day, upsert keyed by
+    Metric_Date (one record per day).
+
+    period=hourly: window = the rolling 24h ending at the top of the current
+    hour, upsert keyed by Metric_Date + Metric_Hour (intraday snapshots).
+
+    Uses the same KPI math as /metrics/impact. Gated by ZOHO_SYNC_ENABLED.
     """
     enabled = os.getenv("ZOHO_SYNC_ENABLED", "").strip().lower() in ("1", "true", "yes")
     if not enabled:
@@ -3012,10 +3216,13 @@ async def admin_metrics_push_zoho(
         except ValueError:
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
-    from src.integrations.zoho.push_metrics import push_day
+    from src.integrations.zoho.push_metrics import push_day, push_hour
 
     try:
-        result = await asyncio.to_thread(push_day, db, day)
+        if period == "hourly":
+            result = await asyncio.to_thread(push_hour, db)
+        else:
+            result = await asyncio.to_thread(push_day, db, day)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:  # noqa: BLE001 - surface push failures to the admin
@@ -3024,7 +3231,9 @@ async def admin_metrics_push_zoho(
 
     return {
         "success": True,
+        "period": period,
         "date": result["date"],
+        "hour": result.get("hour"),
         "record": result["record"],
     }
 

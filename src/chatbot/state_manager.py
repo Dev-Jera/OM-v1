@@ -32,7 +32,7 @@ class StateManager:
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        self.redis.set_session(session_id, session_data, ttl=1800)
+        self.redis.set_session(session_id, session_data, ttl=86400)
 
         return session_id
 
@@ -165,6 +165,9 @@ class StateManager:
             return
 
         conversation_id = session.get("conversation_id")
+        session_context = dict(session.get("context") or {})
+        user_id = session.get("user_id")
+
         if conversation_id and hasattr(self.db, "end_conversation"):
             try:
                 self.db.end_conversation(conversation_id)
@@ -180,6 +183,28 @@ class StateManager:
                 )
             except Exception:
                 pass
+
+        # Push conversation to Zoho CRM (fire-and-forget, reads data BEFORE Redis deletion)
+        try:
+            from src.integrations.zoho.conversation_push import push_conversation_to_zoho
+
+            conversation_obj = None
+            if conversation_id and hasattr(self.db, "get_conversation"):
+                try:
+                    conversation_obj = self.db.get_conversation(conversation_id)
+                except Exception:
+                    pass
+
+            push_conversation_to_zoho(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                session_context=session_context,
+                db=self.db,
+                conversation=conversation_obj,
+                background=True,
+            )
+        except Exception:
+            pass
 
         # Delete from Redis
         self.redis.delete_session(session_id)

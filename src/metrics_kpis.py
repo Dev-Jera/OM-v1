@@ -65,8 +65,17 @@ def compute_impact_metrics(
     resolution_rate = _rate(resolved, verdict_total)
     # Self-serve: handled without a human and the bot was not down.
     self_serve_rate = _rate(self_serve, conversations)
-    # "Could not answer" = unresolved (content gap); one conversation each.
-    fallback_rate = _rate(unresolved, conversations)
+
+    # Query actual fallback count from metrics
+    conversation_rows = db.list_conversations(start, now)
+    conversation_ids = [str(c.id) for c in conversation_rows]
+    fallback_count = db.count_metric_events(
+        start=start,
+        end=now,
+        metric_type="fallbacks",
+        conversation_ids=conversation_ids,
+    )
+    fallback_rate = _rate(fallback_count, conversations)
     bot_down_rate = _rate(bot_down, conversations)
 
     # ---- latency (successful bot replies only; errors record no latency) ----
@@ -103,7 +112,6 @@ def compute_impact_metrics(
     csat_escalated = _avg(csat_escalated_ratings)
 
     # ---- off-hours handling (business hours Mon-Fri 08:00-17:00 Kampala = UTC+3) ----
-    conversation_rows = db.list_conversations(start, now)
 
     def _is_off_hours(dt: datetime) -> bool:
         local = dt + timedelta(hours=3)

@@ -30,6 +30,12 @@ class EscalationService:
         # Mark session as escalated in state manager (DB, Redis, etc.)
         if self.state_manager:
             self.state_manager.mark_escalated(session_id, reason=reason, metadata=metadata or {})
+            # NEW: Set flag for Zoho bot flow to pick up
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            ctx["escalation_requested"] = True
+            ctx["escalation_reason"] = reason
+            self.state_manager.update_session(session_id, {"context": ctx})
         # Add to queue for agents
         if self.queue_backend:
             self.queue_backend.add_to_queue(escalation_record)

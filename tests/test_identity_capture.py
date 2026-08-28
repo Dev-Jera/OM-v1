@@ -11,12 +11,11 @@ from src.chatbot.modes.conversational import (
     CLIENT_NAME_MASK,
     IDENTITY_ASK_PROMPT,
     ConversationalMode,
-    _derive_name_from_email,
-    _extract_email,
     _extract_name,
     _looks_like_question,
     _time_greeting_eat,
 )
+from src.utils.identity import extract_email, extract_name_from_email
 from src.database.postgres import PostgresDB
 
 
@@ -42,9 +41,9 @@ def _make_mode(db, session_id):
 
 
 def test_extract_email():
-    assert _extract_email("john.doe@example.com") == "john.doe@example.com"
-    assert _extract_email("email me at A.B-1+2@sub.x.co.uk please") == "A.B-1+2@sub.x.co.uk"
-    assert _extract_email("no email here") is None
+    assert extract_email("john.doe@example.com") == "john.doe@example.com"
+    assert extract_email("email me at A.B-1+2@sub.x.co.uk please") == "a.b-1+2@sub.x.co.uk"
+    assert extract_email("no email here") is None
 
 
 def test_extract_name():

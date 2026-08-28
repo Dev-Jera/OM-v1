@@ -17,7 +17,7 @@ class RedisCache:
     Redis-backed session cache. Use when REDIS_URL is set in production.
     """
 
-    def __init__(self, url: str, default_ttl: int = 1800, draft_ttl: int = 604800) -> None:
+    def __init__(self, url: str, default_ttl: int = 86400, draft_ttl: int = 604800) -> None:
         self._client = redis.from_url(url, decode_responses=True)
         self._default_ttl = default_ttl
         self._draft_ttl = draft_ttl

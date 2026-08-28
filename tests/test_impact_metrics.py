@@ -26,8 +26,8 @@ async def test_impact_metrics_kpi_suite():
 
     # Off-hours conversation: yesterday 22:00 UTC => 01:00 Kampala (UTC+3), off-hours.
     off_hours_conv = db.create_conversation(user_id=str(user_b.id), mode="conversational")
-    off_hours_conv.created_at = now - timedelta(days=1)
     off_start = (now - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
+    off_hours_conv.created_at = off_start
     db.add_conversation_event(
         conversation_id=off_hours_conv.id,
         event_type="chat_request",
@@ -76,6 +76,12 @@ async def test_impact_metrics_kpi_suite():
         conversation_id=conv_ids[2],
         event_type="unanswered_question",
         payload={"reason": "no_chunks"},
+        created_at=now - timedelta(minutes=5),
+    )
+    db.add_rag_metric(
+        metric_type="fallbacks",
+        value=1.0,
+        conversation_id=conv_ids[2],
         created_at=now - timedelta(minutes=5),
     )
 

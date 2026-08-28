@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 import logging
 import re
 import time
+from src.utils.identity import extract_email, extract_name_from_email, is_valid_email
 
 logger = logging.getLogger(__name__)
 
@@ -21,24 +22,6 @@ def _time_greeting_eat() -> str:
         return "Good afternoon"
     else:
         return "Good evening"
-
-
-def _derive_name_from_email(email: str) -> Optional[str]:
-    """Extract a human-readable first name from an email address.
-
-    Examples:
-        john.doe@company.com  → 'John'
-        jane_smith@company.com → 'Jane'
-        john@company.com       → 'John'
-        info@company.com       → None (too generic)
-    """
-    local = (email or "").split("@")[0]
-    parts = re.split(r"[._\-]+", local)
-    skip = {"info", "admin", "support", "hello", "contact", "enquiry", "enquiries", "office", "team", "hr"}
-    name_parts = [p for p in parts if p.isalpha() and p.lower() not in skip and len(p) > 1]
-    if name_parts:
-        return name_parts[0].capitalize()
-    return None
 
 
 def _is_greeting(message: str) -> bool:
@@ -57,7 +40,7 @@ def _is_memory_question(message: str) -> bool:
     """
     m = (message or "").strip().lower()
     return bool(
-        re.search(r"\b(do you still remember me|do you remember me|remember me|know my name)\b", m)
+        re.search(r"\b(do you still remember me|do you remember me|remember me|know my name|do you know me|know me)\b", m)
     )
 
 
@@ -97,7 +80,7 @@ def _identity_question_kind(message: str) -> str | None:
     asks_mia = bool(re.search(r"\b(who are you|what are you|tell me about yourself)\b", m))
     asks_user = bool(
         re.search(
-            r"\b(who am i|what(?:'s|s| is) my name|what are my names|do you know who i am)\b",
+            r"\b(who am i|what(?:'s|s| is) my name|what are my names|do you know who i am|do you know me|know me)\b",
             m,
         )
     )
@@ -147,14 +130,6 @@ COMPLETION_RESOLVED_PROMPT = "Great to hear! If you have anything else, I'm here
 COMPLETION_UNRESOLVED_PROMPT = (
     "I'm sorry I couldn't help with everything. Would you like me to connect you with a human agent?"
 )
-
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-
-def _extract_email(text: Optional[str]) -> Optional[str]:
-    m = _EMAIL_RE.search(text or "")
-    return m.group(0) if m else None
-
 
 def _extract_name(text: Optional[str], email: Optional[str] = None) -> Optional[str]:
     t = (text or "").strip()
@@ -217,6 +192,9 @@ def _detect_section_intent(message: str) -> str | None:
 
 
 def _detect_digital_flow(message: str) -> str | None:
+    """Detect which product flow a message refers to.
+    Used for product detection in Q&A, not for triggering guided flows.
+    Guided flows are now accessed via main menu buttons."""
     m = (message or "").lower()
     if any(k in m for k in ["personal accident", "pa cover", "accident insurance", "accident cover", "pa insurance"]):
         return "personal_accident"
@@ -876,6 +854,39 @@ class ConversationalMode:
             # Fallback: no response processor available
             self.response_processor = None
 
+    def _maybe_log_product_interest(self, session_id: str, ctx: dict) -> None:
+        """Log product interest once per conversation (first mention only)."""
+        if ctx.get("product_logged"):
+            return
+        topic = ctx.get("product_topic") or {}
+        product_name = topic.get("name")
+        if not product_name:
+            return
+        db = getattr(self.state_manager, "db", None)
+        if db is None or not hasattr(db, "log_product_interest"):
+            return
+        session = self.state_manager.get_session(session_id) or {}
+        conversation_id = session.get("conversation_id") or session_id
+        user_id = session.get("user_id", "anonymous")
+        try:
+            digital_flow = topic.get("digital_flow") or ""
+            category_map = {
+                "motor_private": "vehicle",
+                "travel_insurance": "personal",
+                "personal_accident": "personal",
+                "serenicare": "personal",
+            }
+            product_category = category_map.get(digital_flow, "general")
+            db.log_product_interest(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                product_name=product_name,
+                product_category=product_category,
+            )
+            ctx["product_logged"] = True
+        except Exception:
+            pass
+
     async def process(self, message: str, session_id: str, user_id: str, form_data: Optional[Dict[str, Any]] = None, db=None) -> Dict:
         """Process message in conversational mode"""
         start_time = time.time()
@@ -1118,6 +1129,7 @@ class ConversationalMode:
                         "doc_id": picked.get("product_id"),
                         "url": picked.get("url"),
                     }
+                    self._maybe_log_product_interest(session_id, ctx)
                     self.state_manager.update_session(session_id, {"context": ctx})
 
                 # If we still don't know which product, ask a single clarifying question.
@@ -1333,10 +1345,13 @@ class ConversationalMode:
         sources = response.get("sources", [])
         metrics_to_emit = [
             _metric_payload("confidence_score", confidence, conversation_id),
-            _metric_payload("retrieval_accuracy", min(len(sources) / 5.0, 1.0), conversation_id),
+            _metric_payload("retrieval_accuracy", min(len(sources) / 5.0, 1.0), conversation_id),  # DEPRECATED
+            _metric_payload("source_coverage", min(len(sources) / 5.0, 1.0), conversation_id),
         ]
+        fallback_emitted = False
         if not sources:
             metrics_to_emit.append(_metric_payload("fallbacks", 1.0, conversation_id))
+            fallback_emitted = True
         # ---- End metrics ----
 
         # --- Escalation/handover logic ---
@@ -1370,7 +1385,7 @@ class ConversationalMode:
             follow_up_flag = processed.get("follow_up", False)
             processed_reason = (processed.get("metadata") or {}).get("reason")
             processed_fallback = bool(processed.get("fallback"))
-            if processed.get("fallback"):
+            if processed.get("fallback") and not fallback_emitted:
                 metrics_to_emit.append(_metric_payload("fallbacks", 1.0, conversation_id))
         else:
             answer_text = response["answer"]
@@ -1431,6 +1446,7 @@ class ConversationalMode:
             }
             if top_product:
                 ctx.pop("pending_product_choice", None)
+            self._maybe_log_product_interest(session_id, ctx)
             self.state_manager.update_session(session_id, {"context": ctx})
 
         # Append a natural follow-up prompt when the user is learning about a product.
@@ -1696,34 +1712,26 @@ class ConversationalMode:
 
         if result.quote_requested:
             intent = "quote"
-            product_flow = result.product or _detect_digital_flow(message) or topic.get("digital_flow")
+            # Redirect to main menu instead of switching to guided flow
             suggested_action = {
-                "type": "switch_to_guided",
-                "flow": "journey",
-                "initial_data": {"product_flow": product_flow},
-                "buttons": [{"label": "Get quotation", "action": "get_quotation"}],
+                "type": "redirect_to_main_menu",
+                "message": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there."
             }
-            # Remember we offered a quote so the next free-text yes/no is
-            # resolved by the brain's confirmation bridge above.
-            session = self.state_manager.get_session(session_id) or {}
-            ctx = dict(session.get("context") or {})
-            ctx["pending_quote_offer"] = True
-            self.state_manager.update_session(session_id, {"context": ctx})
-
-        # MIA answers confidently and we do NOT auto-arm a human-agent handoff here.
-        # A handoff is only offered when the user asks for one or declines the
-        # completion question. Keep the "couldn't answer" signal for metrics so
-        # fallback_rate stays honest.
-        show_handover_button = False
-        if not result.quote_requested and (
-            not result.sources or result.confidence < 0.2
-        ):
-            self._log_unanswered(
-                db,
-                conversation_id or session_id,
-                message,
-                reason="no_chunks" if not result.sources else "low_confidence",
-            )
+            # Don't set pending_quote_offer since we're not using guided flow
+            # Don't switch to guided mode - user will use main menu for quotes
+        else:
+            # MIA answers confidently and we do NOT auto-arm a human-agent handoff here.
+            # A handoff is only offered when the user asks for one or declines the
+            # completion question. Keep the "couldn't answer" signal for metrics so
+            # fallback_rate stays honest.
+            show_handover_button = False
+            if not result.sources or result.confidence < 0.2:
+                self._log_unanswered(
+                    db,
+                    conversation_id or session_id,
+                    message,
+                    reason="no_chunks" if not result.sources else "low_confidence",
+                )
 
         payload = {
             "mode": "conversational",
@@ -1844,19 +1852,26 @@ class ConversationalMode:
         doc_id = topic.get("doc_id")
         url = topic.get("url")
 
-        # Quote button: frontend should start guided journey (digital only).
-        # The router handles action=get_quotation and will immediately return the first product form/cards.
-        if action == "get_quote" and digital_flow:
-            return {
-                "mode": "conversational",
-                "response": "Sure — click 'Get quotation' to begin.",
-                "suggested_action": {
-                    "type": "switch_to_guided",
-                    "flow": "journey",
-                    "initial_data": {"product_flow": digital_flow},
-                    "buttons": [{"label": "Get quotation", "action": "get_quotation"}],
-                },
-            }
+        # Quote button: redirect to main menu instead of starting guided journey
+        if action in ("get_quotation", "get_quote"):
+            if digital_flow:
+                return {
+                    "mode": "conversational",
+                    "response": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there.",
+                    "suggested_action": {
+                        "type": "redirect_to_main_menu",
+                        "message": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there."
+                    }
+                }
+            else:
+                return {
+                    "mode": "conversational",
+                    "response": "To get a quote, please go to the main menu and click 'Get Quote' to select a product and follow the steps.",
+                    "suggested_action": {
+                        "type": "redirect_to_main_menu",
+                        "message": "To get a quote, please go to the main menu and click 'Get Quote' to select a product and follow the steps."
+                    }
+                }
 
         if action == "how_to_access":
             msg = "This product is not available as a digital buy/quote journey in this chatbot. "
@@ -1959,6 +1974,7 @@ class ConversationalMode:
             "doc_id": product_id,
             "url": product.get("url"),
         }
+        self._maybe_log_product_interest(session_id, ctx)
         self.state_manager.update_session(session_id, {"context": ctx})
 
         return "\n\n".join(parts)
@@ -2309,11 +2325,13 @@ class ConversationalMode:
                 logger.warning("[identity] failed to record identity event: %s", exc)
 
     def _maybe_handle_identity_capture(self, message: str, session_id: str, user_id: str, conversation_id: Optional[str], session: Dict[str, Any], db, start_time: float) -> Optional[Dict[str, Any]]:
-        """Greeting flow: ask for the user's email once per user (privacy-safe).
-
-        Returns a response payload when this turn is consumed by identity
-        capture, otherwise None so normal processing continues. The client's
-        name is derived from the email address; the email is stored for follow-up.
+        """Email-based identity flow:
+        
+        1. First hello -> ask for email
+        2. User provides email -> extract name, call identify endpoint logic, merge identities
+        3. After email -> "Noted. What are you looking into today? Investment? Life assurance? General insurance?"
+        4. Returning user (has email/name) -> "Welcome back {name}! How can I help you today?"
+        5. User refuses email -> "No problem! How can I help you today?" -> continue anonymously
         """
         try:
             if not message or not (message or "").strip():
@@ -2323,135 +2341,198 @@ class ConversationalMode:
                 db = getattr(self.state_manager, "db", None)
 
             ctx = dict(session.get("context") or {})
-            pending = bool(ctx.get("pending_identity_capture"))
             time_greeting = _time_greeting_eat()
 
-            if not pending:
+            # Check if user already has email/name in context (returning user)
+            if ctx.get("email_collected") and ctx.get("name"):
+                # Returning user with known name - welcome back
+                if _is_greeting(message) or _is_memory_question(message):
+                    welcome_msg = f"You're {ctx['name']}! How can I help you today?"
+                    return self._identity_response(welcome_msg, "greeting_returning")
+                # For non-greeting messages, just continue normally
+                return None
+
+            # Session context empty — try DB lookup for returning user
+            db_name = None
+            db_email = None
+            if db is not None and user_id and hasattr(db, "get_user_by_id"):
+                try:
+                    _db_user = db.get_user_by_id(user_id)
+                    if _db_user and getattr(_db_user, "email", None):
+                        db_email = _db_user.email
+                        db_name = (getattr(_db_user, "name", None) or "").strip() or extract_name_from_email(db_email)
+                except Exception:
+                    pass
+
+            if db_name:
+                # Returning user recognised via DB — populate context and greet
+                ctx["email_collected"] = True
+                ctx["name"] = db_name
+                ctx["email"] = db_email
+                ctx["user_id"] = user_id
+                self.state_manager.update_session(session_id, {"context": ctx})
+                if _is_greeting(message) or _is_memory_question(message):
+                    return self._identity_response(
+                        f"You're {db_name}! How can I help you today?",
+                        "greeting_returning",
+                    )
+                # Handle "who am I" / "what's my name" questions
+                if _identity_question_kind(message) == "user":
+                    return self._identity_response(
+                        f"You're {db_name}! How can I help you today?",
+                        "greeting_returning",
+                    )
+                return None
+
+            # Check if we're awaiting email
+            pending_identity = ctx.get("pending_identity_capture", False)
+
+            if not pending_identity:
+                # First turn - check if it's a greeting or identity question
                 identity_kind = _identity_question_kind(message)
+
                 if not _is_greeting(message):
                     if identity_kind is None and not _is_memory_question(message):
                         return None
-                user = None
-                if db is not None and hasattr(db, "get_user_by_id"):
-                    try:
-                        user = db.get_user_by_id(user_id)
-                    except Exception:
-                        user = None
-                name = (getattr(user, "name", None) or "").strip() if user is not None else ""
+
+                # Handle identity questions about assistant
                 if identity_kind == "assistant":
                     return self._identity_response(ASSISTANT_IDENTITY_PROMPT, "assistant_identity")
                 if identity_kind == "both":
-                    if name:
-                        return self._identity_response(
-                            f"I'm Mia, your Old Mutual Uganda virtual assistant. You're {name}.",
-                            "combined_identity",
-                        )
                     return self._identity_response(
-                        f"{ASSISTANT_IDENTITY_PROMPT} {USER_IDENTITY_UNKNOWN_PROMPT}",
+                        f"{ASSISTANT_IDENTITY_PROMPT} I don't know your name yet. Could you share your email address so I can help you better?",
                         "combined_identity",
                     )
-                # Handle memory questions first - they need a specific "You're {name}..." response with intent "greeting_returning"
-                if user is not None and (getattr(user, "email", None) or "").strip() and _is_memory_question(message):
-                    if name:
-                        return self._identity_response(
-                            f"You're {name}. How can I help you today?",
-                            "greeting_returning",
-                        )
-                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
 
-                # Then handle greetings and identity_kind == "user"
-                if user is not None and (getattr(user, "email", None) or "").strip() and identity_kind == "user":
-                    if name:
-                        return self._identity_response(
-                            f"You're {name}. How can I help you today?",
-                            "greeting_returning",
-                        )
-                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
-
-                # Handle greetings
-                if user is not None and (getattr(user, "email", None) or "").strip() and _is_greeting(message):
-                    if name:
-                        return self._identity_response(
-                            _random_greeting(name),
-                            "greeting_returning",
-                        )
-                    return self._identity_response(
-                        _random_greeting(name),
-                        "greeting_returning",
-                    )
-                if _is_memory_question(message) or identity_kind == "user":
+                # Handle memory questions (DB lookup already failed above)
+                if _is_memory_question(message):
                     ctx["pending_identity_capture"] = True
                     self.state_manager.update_session(session_id, {"context": ctx})
-                    if name:
-                        return self._identity_response(f"You're {name}.", "identity_check")
-                    return self._identity_response(USER_IDENTITY_UNKNOWN_PROMPT, "identity_check")
+                    return self._identity_response("I don't know your name yet. Could you share your email so I can recognize you next time?", "identity_check")
+
+                # Handle "who am I" questions (DB lookup already failed above)
+                if identity_kind == "user":
+                    ctx["pending_identity_capture"] = True
+                    self.state_manager.update_session(session_id, {"context": ctx})
+                    return self._identity_response("I don't know your name yet. Could you share your email address so I can help you better?", "identity_check")
+
+                # It's a greeting - start email collection
                 ctx["pending_identity_capture"] = True
+                ctx["email_collected"] = False
                 self.state_manager.update_session(session_id, {"context": ctx})
+                
                 _emit_metrics(
                     db,
                     [_metric_payload("response_latency", time.time() - start_time, conversation_id)],
                 )
                 self._emit_intent_event(db, conversation_id, "greeting", "NO_RETRIEVAL", message, start_time)
-                ask = IDENTITY_ASK_PROMPT.format(time_greeting=time_greeting)
+                
+                ask = f"{time_greeting}, I'm MIA, your Old Mutual virtual assistant. Could you provide your email so that I am able to help you better?"
                 return self._identity_response(ask, "greeting")
 
-            # Pending capture: this turn should contain the identity info.
-            if _is_greeting(message):
-                ask = IDENTITY_ASK_PROMPT.format(time_greeting=time_greeting)
-                return self._identity_response(ask, "greeting")
+            # Awaiting email - user should provide email now
+            # Check for refusal first
+            message_lower = message.strip().lower()
+            refusal_keywords = ["no", "nope", "skip", "later", "not now", "dont want", "don't want", "refuse", "no thanks", "no thank you"]
+            is_refusal = any(kw in message_lower for kw in refusal_keywords)
+            
+            if is_refusal:
+                # User declined - continue anonymously
+                ctx.pop("pending_identity_capture", None)
+                ctx["email_declined"] = True
+                self.state_manager.update_session(session_id, {"context": ctx})
+                return self._identity_response("No problem! How can I help you today?", "email_declined")
 
-            email = _extract_email(message)
-
+            # Try to extract email
+            email = extract_email(message)
+            
             if email:
                 email = email.strip().lower()
-                name = _derive_name_from_email(email)
+                
+                if not is_valid_email(email):
+                    return self._identity_response("That doesn't look like a valid email address. Could you please provide a valid email?", "invalid_email")
+
+                # Valid email provided - process it
+                name = extract_name_from_email(email)
+                
+                # Find or create user by email (same logic as identify endpoint)
                 existing = None
                 if db is not None and hasattr(db, "find_user_by_email"):
                     try:
                         existing = db.find_user_by_email(email)
                     except Exception as exc:
                         logger.warning("[identity] email lookup failed: %s", exc)
-                if existing is not None and str(getattr(existing, "id", "")) != str(user_id):
+                
+                if existing is not None:
+                    # Existing user with this email
                     canonical_id = str(existing.id)
                     canonical_name = (getattr(existing, "name", None) or "").strip() or name
-                    self._save_identity(
-                        db, canonical_id, canonical_name, email, conversation_id, via="greeting_relink"
-                    )
+                    if not canonical_name:
+                        canonical_name = name
+                        db.set_user_identity(existing.id, name=canonical_name, email=email)
+                    
+                    # Merge: update session to use canonical user_id
+                    ctx.pop("pending_identity_capture", None)
+                    ctx["email_collected"] = True
+                    ctx["name"] = canonical_name
+                    ctx["email"] = email
+                    ctx["user_id"] = canonical_id
+                    self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
+                    
+                    # Emit identity_relinked event
                     if db is not None and hasattr(db, "add_conversation_event"):
                         try:
                             db.add_conversation_event(
                                 conversation_id=conversation_id,
                                 event_type="identity_relinked",
-                                payload={
-                                    "email": email,
-                                    "name_masked": CLIENT_NAME_MASK,
-                                    "has_name": bool(canonical_name),
-                                },
+                                payload={"name_masked": CLIENT_NAME_MASK, "email": email},
                             )
-                        except Exception as exc:
-                            logger.warning("[identity] failed to record relink event: %s", exc)
+                        except Exception:
+                            pass
+                    
+                    welcome_msg = f"Welcome back, {canonical_name}! How can I help you today?"
+                    return self._identity_response(welcome_msg, "identity_relinked")
+                else:
+                    # New user - attach email identity to the existing user record
+                    name = extract_name_from_email(email)
+                    db.set_user_identity(user_id, name=name, email=email)
+                    canonical_id = str(user_id)
+                    
+                    # Update session context
                     ctx.pop("pending_identity_capture", None)
+                    ctx["email_collected"] = True
+                    ctx["name"] = name
+                    ctx["email"] = email
+                    ctx["user_id"] = canonical_id
                     self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
-                    welcome = f"Welcome back, {canonical_name}! How can I help you today?"
-                    return self._identity_response(welcome, "identity_relinked")
-                self._save_identity(db, user_id, name, email, conversation_id, via="greeting")
-                ctx.pop("pending_identity_capture", None)
-                self.state_manager.update_session(session_id, {"context": ctx})
-                confirmed = IDENTITY_CONFIRMED_PROMPT.format(time_greeting=time_greeting)
-                return self._identity_response(confirmed, "identity_captured")
+                    
+                    # Emit identity_captured event
+                    if db is not None and hasattr(db, "add_conversation_event"):
+                        try:
+                            db.add_conversation_event(
+                                conversation_id=conversation_id,
+                                event_type="identity_captured",
+                                payload={"name_masked": CLIENT_NAME_MASK, "email": email},
+                            )
+                        except Exception:
+                            pass
+                    
+                    welcome_msg = f"Noted. What are you looking into today? Investment? Life assurance? General insurance? Let me know how I can be of good help."
+                    return self._identity_response(welcome_msg, "identity_captured")
 
-            if _looks_like_question(message):
-                # Not identity info — stop waiting and process normally.
+            # No email found - check if it's a question (user wants to skip)
+            if _looks_like_question(message) or len(message.strip()) > 3:
+                # User asked something else - they don't want to give email
                 ctx.pop("pending_identity_capture", None)
+                ctx["email_declined"] = True
                 self.state_manager.update_session(session_id, {"context": ctx})
-                return None
+                return None  # Let normal processing continue
 
-            # Unrecognized short reply: don't block the conversation.
-            ctx.pop("pending_identity_capture", None)
-            self.state_manager.update_session(session_id, {"context": ctx})
-            return None
+            # Unrecognized short reply - ask for email again
+            return self._identity_response("I didn't catch a valid email address. Could you please provide your email so I can help you better?", "invalid_email")
+
         except Exception as exc:
-            logger.warning("[identity] identity capture failed, continuing normally: %s", exc)
+            logger.warning("[identity] email capture failed, continuing normally: %s", exc)
             return None
 
     def _get_recent_history(self, session_id: str, limit: int = 10) -> List[Dict]:

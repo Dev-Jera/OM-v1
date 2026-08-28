@@ -262,7 +262,7 @@ class MotorPrivateApplication(Base):
 
     # Step 3: Premium Calculation
     vehicle_make: Mapped[str] = mapped_column(String(50), nullable=False)
-    year_of_manufacture: Mapped[int] = mapped_column(String(4), nullable=False)
+    year_of_manufacture: Mapped[str] = mapped_column(String(4), nullable=False)
     cover_start_date: Mapped[str] = mapped_column(String(20), nullable=False)  # ISO date string
     is_rare_model: Mapped[str] = mapped_column(String(8), nullable=False)  # "yes" or "no"
     has_undergone_valuation: Mapped[str] = mapped_column(String(8), nullable=False)  # "yes" or "no"
@@ -271,3 +271,34 @@ class MotorPrivateApplication(Base):
     quote_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+# ======================================================================
+# Complaints
+# ======================================================================
+
+class Complaint(Base):
+    __tablename__ = "complaints"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str] = mapped_column(String(200), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    complaint: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="submitted", nullable=False)
+    zoho_record_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class ProductLog(Base):
+    __tablename__ = "product_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    conversation_id: Mapped[str] = mapped_column(String(36), ForeignKey("conversations.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    product_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    zoho_record_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
