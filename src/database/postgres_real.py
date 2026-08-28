@@ -447,7 +447,7 @@ class PostgresDB:
             )
             if conversation_ids:
                 stmt = stmt.where(RAGMetric.conversation_id.in_(conversation_ids))
-            return s.scalar() or 0
+            return s.scalar(stmt) or 0
 
     def list_escalations(self, start: datetime, end: datetime) -> List[EscalationSession]:
         with self._session() as s:
