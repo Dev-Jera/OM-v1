@@ -1399,6 +1399,7 @@ class ConversationalMode:
             self._log_service_error(
                 db, conversation_id, message, response.get("error_kind") or "system_error"
             )
+            show_handover_button = True
         elif not retrieval_results or not sources or confidence < 0.2 or processed_fallback:
             reason = (
                 "no_chunks"

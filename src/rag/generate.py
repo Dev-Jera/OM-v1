@@ -41,16 +41,18 @@ CANNOT_ANSWER_MESSAGE = (
 )
 
 ERROR_RETRY_MESSAGE = (
-    "I'm having trouble retrieving this information right now. "
-    "Please reach out to us on Tel: +256 414 332700 or Toll free line: 0800132700 to be helped, "
-    "or try again in a moment."
+    "I'm sorry, I'm experiencing a technical issue right now and can't provide that answer. "
+    "Here's how you can reach us:\n\n"
+    "**Call us:** 0800 132 700 (Toll Free) or +256 414 332 700\n"
+    "**Email:** info-gi@oldmutual.co.ug\n\n"
+    "You can also type 'talk to agent' to connect with a human representative."
 )
 
 
 def is_system_error_answer(text: str) -> bool:
     """True when the reply is the reserved 'system error' retry message."""
     lowered = (text or "").strip().lower()
-    return bool(lowered) and "please try again in a moment" in lowered
+    return bool(lowered) and "i'm experiencing a technical issue" in lowered
 
 
 def classify_generation_error(exc: Exception) -> str:

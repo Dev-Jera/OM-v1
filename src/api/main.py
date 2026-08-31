@@ -1867,6 +1867,9 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
 
         state_manager.update_session(session_id, {"recent_messages": cached_messages[-10:]})
 
+    if response.get("show_handover_button"):
+        response["contact_numbers"] = CONTACT_NUMBERS
+
     return ChatResponse(response=response, session_id=session_id, mode=response.get("mode", "conversational"), timestamp=datetime.now().isoformat())
 
 
@@ -1890,6 +1893,7 @@ PRODUCTS_WITH_BUY_ROUTE = {
 CONTACT_NUMBERS = {
     "tel": "+256 414 332700",
     "toll_free": "0800132700",
+    "email": "info-gi@oldmutual.co.ug",
 }
 
 DISCLAIMER_NON_ROUTED = (

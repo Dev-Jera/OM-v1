@@ -68,7 +68,7 @@ def test_upsert_search_exists_updates_record():
     }
     assert update_req["method"] == "PUT"
     assert update_req["url"] == "https://www.zohoapis.com/crm/v2/Mia_Bot_Metrics/748410001"
-    assert update_req["json"]["Conversations"] == 3
+    assert update_req["json"]["data"][0]["Conversations"] == 3
 
 
 def test_upsert_no_match_creates_record():
