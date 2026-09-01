@@ -346,6 +346,30 @@ class MiaGenerator:
             finish_reason = getattr(fr, "value", fr)
         return text, finish_reason
 
+    @staticmethod
+    def _gemini_parts(response) -> List[str]:
+        """Extract plain text across a Gemini response's candidate parts.
+
+        google-genai (2.x) models may return HTTPS 200 with an empty ``.text``
+        because the only content parts are non-text (a function_call, a thought /
+        thinking block, or a safety-blocked candidate). This walks every
+        candidate's content parts and concatenates any real text so we recover a
+        usable answer instead of treating a non-text-only response as a failure.
+        """
+        collected: List[str] = []
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            for cand in candidates:
+                content = getattr(cand, "content", None)
+                parts = getattr(content, "parts", None) or []
+                for part in parts:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text.strip():
+                        collected.append(text.strip())
+        except Exception:
+            logger.debug("_gemini_parts could not parse response", exc_info=True)
+        return collected
+
     async def generate(self, question: str, hits: List[Dict[str, Any]], conversation_history: List[Dict] = None) -> str:
         self.last_error_kind = None
         context, num_sources, _ = self._build_context(hits)
@@ -445,8 +469,33 @@ class MiaGenerator:
                 response = await asyncio.to_thread(_sync_generate, full_prompt, 1200)
                 text, finish_reason = self._extract_response(response)
                 if not text:
+                    # The provider may return HTTP 200 with an empty .text when the
+                    # response contains only non-text parts (function_call, thought,
+                    # or a safety-blocked candidate). Recover real text from the raw
+                    # parts across ALL candidates before treating this as empty.
+                    recovered = self._gemini_parts(response)
+                    if recovered:
+                        text = "\n\n".join(recovered)
+                        logger.info(
+                            "Recovered %d non-empty part(s) from Gemini response (empty .text).",
+                            len(recovered),
+                        )
+                if not text:
                     logger.warning("LLM returned empty text response.")
                     self.last_error_kind = "empty_output"
+                    # Non-text-only responses (e.g. a lone function_call) give the
+                    # model nothing to render; do one clean retry below before the
+                    # friendly technical-issue fallback.
+                    if attempt < max_attempts:
+                        backoff = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                        logger.warning(
+                            "Empty LLM output on attempt %s/%s; retrying in %.2fs...",
+                            attempt,
+                            max_attempts,
+                            backoff,
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
                     return ERROR_RETRY_MESSAGE
 
                 # Request a continuation only when the provider reports the output

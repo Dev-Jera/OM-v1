@@ -34,6 +34,46 @@ def _is_greeting(message: str) -> bool:
     return m in {"hi", "hello", "hey", "hey!", "hello!", "hi!", "good morning", "good afternoon", "good evening"}
 
 
+def _looks_like_noise(message: str) -> bool:
+    """Recognize gibberish / mash input (e.g. 'mmmm...', 'mnmnmn...', '&&&&').
+
+    Returns True for repetitive or non-alphabetic nuisance input so the bot can
+    reply with a natural "didn't catch that" clarification instead of routing it
+    through RAG (0 hits) -> empty Gemini output -> misleading technical-error +
+    human-agent fallback.
+
+    Conservative by design: real questions, digits, and payment-like inputs
+    (e.g. '2000000') must NOT be flagged.
+    """
+    raw = (message or "").strip()
+    if not raw:
+        return False
+    m = raw.lower()
+
+    letters = [c for c in m if c.isalpha()]
+    digits = [c for c in m if c.isdigit()]
+    total = len(raw)
+
+    # Pure punctuation/symbols (no letters, no digits) of meaningful length.
+    if not letters and not digits:
+        return total >= 3
+
+    # A single letter (or the same character) repeated several times => mash.
+    distinct_chars = set(m)
+    if len(letters) >= 4 and len(distinct_chars) == 1 and len(letters) == total:
+        return True
+
+    # Highly repetitive keyboard mash with few distinct characters relative to
+    # its length (e.g. "mnmnmnmn...", "asdfasdf..."), provided it's not mostly
+    # digits (which can be premium/payment amounts).
+    if digits and len(digits) > len(letters):
+        return False
+    if len(letters) >= 6 and len(distinct_chars) <= 2 and len(letters) == total:
+        return True
+
+    return False
+
+
 def _is_memory_question(message: str) -> bool:
     """Recognize a visitor asking whether Mia remembers them.
 
@@ -1068,6 +1108,25 @@ class ConversationalMode:
             if _is_negative(message):
                 ctx.pop("pending_product_choice", None)
                 self.state_manager.update_session(session_id, {"context": ctx})
+
+        # Gibberish / noise input (e.g. 'mmmm...', 'mnmnmn...') is not a real
+        # question: catch it before intent routing / RAG so we reply with a
+        # natural clarification instead of an empty-Gemini-output technical
+        # error + human-agent offer.
+        if form_data is None and _looks_like_noise(message):
+            return self._build_no_retrieval_response(
+                kind="NOISE",
+                answer_text=(
+                    "I didn't quite catch that. Could you tell me what you'd like help with — "
+                    "for example a product, a quote, a premium, or how to reach an agent?"
+                ),
+                message=message,
+                session_id=session_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                db=db,
+                start_time=start_time,
+            )
 
         # LLM-first intent routing: the LLM decides whether this is casual chat
         # (greeting/small-talk/thanks/goodbye/off-topic) or a real Old Mutual
