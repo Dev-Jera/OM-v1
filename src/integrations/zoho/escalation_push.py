@@ -25,6 +25,10 @@ DEFAULT_MODULE = "Mia_Escalations"
 TRANSCRIPT_MESSAGE_LIMIT = 30
 TRANSCRIPT_MAX_CHARS = 30000
 
+# The real customer name is never sent to Zoho; only a masked placeholder, per
+# the privacy requirement that the bot "strictly passes the name as {name}".
+CLIENT_NAME_MASK = ":clients_name"
+
 
 def _enabled() -> bool:
     return os.getenv("ZOHO_ESCALATION_PUSH_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
@@ -85,7 +89,7 @@ def build_escalation_record(
         "Conversation_ID": conversation_id,
         "Session_ID": str(session_id or ""),
         "Reason": str(reason or "")[:255],
-        "Customer_Name": customer_name,
+        "Customer_Name": CLIENT_NAME_MASK if customer_name else "",
         "Phone": phone,
         "Zoho_Contact_Id": zoho_contact_id,
         "Transcript": _build_transcript(db, conversation_id or None),

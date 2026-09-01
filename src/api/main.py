@@ -2093,6 +2093,22 @@ async def identify_session(
         }
         state_manager.update_session(session_id, {"context": context_updates})
 
+        # Push visitor identity into Zoho MiaVisitor (fire-and-forget, masked name).
+        # The real name is never sent to Zoho; only email/phone and a masked
+        # :clients_name placeholder are pushed. This never blocks or breaks the call.
+        try:
+            from src.integrations.zoho.visitor_push import push_visitor_to_zoho
+
+            push_visitor_to_zoho(
+                user_id=internal_user_id,
+                email=email,
+                source="identify",
+                db=db,
+                background=True,
+            )
+        except Exception:
+            logger.warning("Zoho visitor push skipped during identify; continuing", exc_info=True)
+
         # Refresh cookies with new user_id
         response.set_cookie("om_chat_session", create_session_capability(session_id, internal_user_id), httponly=True, secure=os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes"}, samesite=os.getenv("COOKIE_SAMESITE", "lax"), max_age=2592000, path="/")
         # Optionally update visitor_id to email-based for cross-device (keeping device-based for now)

@@ -23,6 +23,10 @@ DEFAULT_MODULE = "Mia_Conversations"
 TRANSCRIPT_MESSAGE_LIMIT = 30
 TRANSCRIPT_MAX_CHARS = 30000
 
+# The real customer name is never sent to Zoho; only a masked placeholder, per
+# the privacy requirement that the bot "strictly passes the name as {name}".
+CLIENT_NAME_MASK = ":clients_name"
+
 
 def _enabled() -> bool:
     return os.getenv("ZOHO_CONVERSATION_PUSH_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
@@ -185,7 +189,7 @@ def build_conversation_record(
         "Name": str(conversation_id or "conversation"),
         "Conversation_ID": str(conversation_id or ""),
         "User_ID": str(user_id or ""),
-        "Customer_Name": customer_name,
+        "Customer_Name": CLIENT_NAME_MASK if customer_name else "",
         "Phone": phone,
         "Zoho_Contact_Id": zoho_contact_id,
         "Product_Name": product_name,

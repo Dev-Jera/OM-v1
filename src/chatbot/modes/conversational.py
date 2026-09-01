@@ -9,6 +9,8 @@ import re
 import time
 from src.utils.identity import extract_email, extract_name_from_email, is_valid_email
 
+from src.integrations.zoho.visitor_push import push_visitor_to_zoho
+
 logger = logging.getLogger(__name__)
 
 
@@ -2183,6 +2185,24 @@ class ConversationalMode:
             "confidence": 1.0,
         }
 
+    def _push_visitor(self, db, user_id, email, source="chat", phone=None):
+        """Fire-and-forget push of a captured visitor identity to Zoho MiaVisitor.
+
+        The real name is never sent to Zoho (masked as :clients_name internally
+        by visitor_push). This never raises and never blocks the chat.
+        """
+        try:
+            push_visitor_to_zoho(
+                user_id=user_id,
+                email=email,
+                phone=phone,
+                source=source,
+                db=db,
+                background=True,
+            )
+        except Exception:
+            logger.exception("Failed to queue Zoho visitor push; chat continues unaffected")
+
     def _emit_intent_event(self, db, conversation_id: Optional[str], intent: str, intent_type: str, message: str, start_time: float) -> None:
         if db is None or not hasattr(db, "add_conversation_event"):
             return
@@ -2479,6 +2499,7 @@ class ConversationalMode:
                     ctx["email"] = email
                     ctx["user_id"] = canonical_id
                     self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
+                    self._push_visitor(db, user_id=canonical_id, email=email, source="chat")
                     
                     # Emit identity_relinked event
                     if db is not None and hasattr(db, "add_conversation_event"):
@@ -2498,7 +2519,7 @@ class ConversationalMode:
                     name = extract_name_from_email(email)
                     db.set_user_identity(user_id, name=name, email=email)
                     canonical_id = str(user_id)
-                    
+
                     # Update session context
                     ctx.pop("pending_identity_capture", None)
                     ctx["email_collected"] = True
@@ -2506,6 +2527,7 @@ class ConversationalMode:
                     ctx["email"] = email
                     ctx["user_id"] = canonical_id
                     self.state_manager.update_session(session_id, {"context": ctx, "user_id": canonical_id})
+                    self._push_visitor(db, user_id=canonical_id, email=email, source="chat")
                     
                     # Emit identity_captured event
                     if db is not None and hasattr(db, "add_conversation_event"):
