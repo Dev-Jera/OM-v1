@@ -26,6 +26,7 @@ import os
 import re
 import asyncio
 import secrets
+import hmac
 from difflib import get_close_matches
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ from src.chatbot.dependencies import (
     create_admin_access_token,
     verify_admin_access_token,
     create_session_capability,
+    get_api_keys,
     require_session_owner,
     session_uid_from_token,
 )
@@ -2257,6 +2259,21 @@ def _refresh_session_cookie(response: Response, http_request: Request, session_i
     )
 
 
+def _is_api_key_authenticated(request: Request) -> bool:
+    """True when the request is authorized by a valid X-API-KEY header.
+
+    Server-to-server callers (Zoho plug via the proxy, or direct API clients)
+    authenticate with the API key instead of a browser session cookie. The key is
+    guaranteed valid by the app-level api_key_protection dependency before any
+    handler runs, so a present matching key is sufficient to treat the caller as
+    authorized for session resumption.
+    """
+    candidate = str(request.headers.get("x-api-key") or "").strip()
+    if not candidate:
+        return False
+    return any(hmac.compare_digest(candidate, k) for k in get_api_keys())
+
+
 @api_router.post("/chat/message", response_model=ChatResponse)
 async def api_send_message(
     request: ChatMessage,
@@ -2266,7 +2283,7 @@ async def api_send_message(
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        if request.session_id:
+        if request.session_id and not _is_api_key_authenticated(http_request):
             require_session_owner(http_request, request.session_id, state_manager.get_session(request.session_id))
         resp = await _handle_chat_message(request, router, db)
         if request.session_id:
@@ -2295,7 +2312,7 @@ async def api_chat(
     db: PostgresDB = Depends(get_db),
 ):
     try:
-        if request.session_id:
+        if request.session_id and not _is_api_key_authenticated(http_request):
             require_session_owner(http_request, request.session_id, state_manager.get_session(request.session_id))
         resp = await _handle_chat_message(request, router, db)
         if request.session_id:
