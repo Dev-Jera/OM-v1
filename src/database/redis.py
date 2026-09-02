@@ -36,6 +36,10 @@ class RedisCache:
     def delete_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
 
+    def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """Return a shallow copy of all live sessions (session_id -> data)."""
+        return dict(self._sessions)
+
     # --- Form draft helpers --------------------------------------------------
 
     def _draft_key(self, session_id: str, flow_name: str) -> str:

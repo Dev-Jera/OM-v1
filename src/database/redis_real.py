@@ -47,6 +47,21 @@ class RedisCache:
     def delete_session(self, session_id: str) -> None:
         self._client.delete(f"session:{session_id}")
 
+    def get_all_sessions(self) -> Dict[str, Any]:
+        """Return all live sessions (session_id -> data) via a non-blocking SCAN."""
+        sessions: Dict[str, Any] = {}
+        cursor = 0
+        while True:
+            cursor, keys = self._client.scan(cursor=cursor, match="session:*", count=500)
+            for key in keys:
+                sid = str(key).split("session:", 1)[-1]
+                data = self.get_session(sid)
+                if data is not None:
+                    sessions[sid] = data
+            if cursor == 0:
+                break
+        return sessions
+
     # --- Form draft helpers --------------------------------------------------
 
     def _draft_key(self, session_id: str, flow_name: str) -> str:

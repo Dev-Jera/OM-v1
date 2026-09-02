@@ -5,9 +5,6 @@ Session and state management for chatbot
 from typing import Dict, Optional, Any
 from datetime import datetime
 import uuid
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 class StateManager:
@@ -205,11 +202,8 @@ class StateManager:
                 db=self.db,
                 conversation=conversation_obj,
                 background=True,
-            )
-            logger.info(
-                "[DBG-CONV][PUSH] session_id=%s conversation_id=%s",
-                session_id,
-                conversation_id,
+                upsert=True,
+                force=True,
             )
         except Exception:
             pass

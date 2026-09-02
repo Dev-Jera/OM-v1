@@ -27,6 +27,36 @@ TRANSCRIPT_MAX_CHARS = 30000
 # the privacy requirement that the bot "strictly passes the name as {name}".
 CLIENT_NAME_MASK = ":clients_name"
 
+# Burst-coalescing window: messages landed within this many seconds collapse
+# into a single push carrying the latest transcript.
+COALESCE_WINDOW_SECONDS = float(os.getenv("ZOHO_CONVERSATION_COALESCE_SECONDS", "10") or 10)
+
+# Last-pushed fingerprint per conversation, to avoid redundant identical pushes.
+_last_pushed: Dict[str, Dict[str, Any]] = {}
+_coalesce_lock = threading.Lock()
+
+
+def _coalesce(conversation_id: str, record: Dict[str, Any]) -> bool:
+    """Return True if this push should proceed (not a redundant identical burst).
+
+    A push is skipped when the same conversation was pushed within the coalesce
+    window AND the transcript did not change since then.
+    """
+    fingerprint = {
+        "Message_Count": record.get("Message_Count"),
+        "Transcript": record.get("Transcript"),
+    }
+    now = datetime.utcnow().timestamp()
+    with _coalesce_lock:
+        prev = _last_pushed.get(str(conversation_id))
+        if prev is not None:
+            within_window = now - prev.get("ts", 0) < COALESCE_WINDOW_SECONDS
+            identical = prev.get("fp") == fingerprint
+            if within_window and identical:
+                return False
+        _last_pushed[str(conversation_id)] = {"ts": now, "fp": fingerprint}
+    return True
+
 
 def _enabled() -> bool:
     return os.getenv("ZOHO_CONVERSATION_PUSH_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
@@ -205,7 +235,7 @@ def build_conversation_record(
     }
 
 
-def _push_sync(record: Dict[str, Any], module: str) -> None:
+def _push_sync(record: Dict[str, Any], module: str, upsert: bool = True) -> None:
     from src.integrations.zoho.crm_writer import ZohoCRMWriter
     from src.integrations.zoho.oauth import ZohoTokenManager
 
@@ -222,7 +252,10 @@ def _push_sync(record: Dict[str, Any], module: str) -> None:
         region=os.getenv("ZOHO_REGION", "com").strip().lower(),
     )
     writer = ZohoCRMWriter(token_manager, module)
-    response = writer.create([record])
+    if upsert:
+        response = writer.upsert_by_key([record], "Conversation_ID")
+    else:
+        response = writer.create([record])
     logger.info(
         "Zoho conversation push ok: conversation=%s outcome=%s response_status=%s",
         record.get("Conversation_ID"),
@@ -239,8 +272,16 @@ def push_conversation_to_zoho(
     db: Any = None,
     conversation: Any = None,
     background: bool = True,
+    upsert: bool = True,
+    force: bool = False,
 ) -> bool:
     """Push one conversation into Zoho CRM. Never raises.
+
+    Uses an idempotent upsert keyed on ``Conversation_ID`` so re-pushing an
+    in-progress conversation (as its transcript grows) updates the existing
+    record instead of creating duplicates. ``force=False`` coalesces bursts:
+    repeated push calls for the same conversation within a short window are
+    collapsed so the record reflects the latest transcript once.
 
     Returns True when a push was attempted (gate open + creds present).
     """
@@ -255,29 +296,70 @@ def push_conversation_to_zoho(
             db=db,
             conversation=conversation,
         )
-        logger.info(
-            "[DBG-CONV][BUILD] conversation_id=%s message_count=%s transcript_chars=%s module=%s",
-            conversation_id,
-            record.get("Message_Count"),
-            len(record.get("Transcript") or ""),
-            os.getenv("ZOHO_CONVERSATION_MODULE", DEFAULT_MODULE),
-        )
     except Exception:
         logger.exception("Failed to build Zoho conversation record; request continues unaffected")
         return False
 
+    if not force and not _coalesce(conversation_id, record):
+        return True
+
     if not background:
         try:
-            _push_sync(record, module)
+            _push_sync(record, module, upsert=upsert)
         except Exception:
             logger.exception("Zoho conversation push failed; request continues unaffected")
         return True
 
     def _worker() -> None:
         try:
-            _push_sync(record, module)
+            _push_sync(record, module, upsert=upsert)
         except Exception:
             logger.exception("Zoho conversation push failed; request continues unaffected")
 
     threading.Thread(target=_worker, daemon=True, name="zoho-conversation-push").start()
     return True
+
+
+def push_pending_conversations(
+    *,
+    sessions: Dict[str, Dict[str, Any]],
+    db: Any,
+    background: bool = True,
+    max_conversations: int = 200,
+) -> int:
+    """Safety-net: (upsert) push any currently-live conversations.
+
+    Enumerates active sessions (session_id -> session data), extracts each
+    session's ``conversation_id``, and pushes its current transcript so no
+    conversation is lost even if it never ends with a goodbye. Coalescing
+    avoids redundant re-pushes of unchanged conversations. Never raises.
+
+    Returns the number of conversations scheduled for push.
+    """
+    if not _enabled():
+        return 0
+    pushed = 0
+    for session_id, session in list((sessions or {}).items()):
+        if pushed >= max_conversations:
+            break
+        if not isinstance(session, dict):
+            continue
+        conversation_id = session.get("conversation_id")
+        if not conversation_id:
+            continue
+        try:
+            push_conversation_to_zoho(
+                conversation_id=str(conversation_id),
+                user_id=session.get("user_id"),
+                session_context=session.get("context") or {},
+                db=db,
+                background=background,
+                upsert=True,
+                force=False,
+            )
+            pushed += 1
+        except Exception:
+            logger.exception("Safety-net push failed for conversation %s", conversation_id)
+    if pushed:
+        logger.info("Zoho safety-net scheduled %s conversation push(es)", pushed)
+    return pushed

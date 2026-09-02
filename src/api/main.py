@@ -253,6 +253,50 @@ async def _service_heartbeat_loop(stop_event: asyncio.Event):
             continue
 
 
+def _zoho_flush_interval_seconds() -> int:
+    raw = (os.getenv("ZOHO_CONVERSATION_FLUSH_INTERVAL_SECONDS") or "").strip()
+    try:
+        value = int(raw)
+        return value if value > 0 else 120
+    except (TypeError, ValueError):
+        return 120
+
+
+async def _zoho_flush_loop(stop_event: asyncio.Event):
+    """Safety-net: periodically re-push live conversations to Zoho.
+
+    Iterates the live Redis sessions and upserts the current transcript for
+    each, so chats that never end with a goodbye are still fully captured.
+    Runs only when real Redis (session enumeration) and the conversation push
+    gate are both active.
+    """
+    interval_seconds = _zoho_flush_interval_seconds()
+    from src.database.redis_real import RedisCache as RealRedisCache
+    from src.integrations.zoho.conversation_push import _enabled as _conv_push_enabled
+
+    if not isinstance(redis_cache, RealRedisCache) or not _conv_push_enabled():
+        logger.info("Zoho conversation safety-net disabled (needs real Redis + push gate)")
+        return
+
+    while not stop_event.is_set():
+        try:
+            sessions = redis_cache.get_all_sessions()
+            if sessions:
+                from src.integrations.zoho.conversation_push import push_pending_conversations
+                await asyncio.to_thread(
+                    push_pending_conversations,
+                    sessions=sessions,
+                    db=postgres_db,
+                    background=True,
+                )
+        except Exception as exc:
+            logger.warning("Zoho conversation safety-net flush failed: %s", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
+
 class APIRAGAdapter:
     """
     Thin async-compatible wrapper around the existing RAG query pipeline.
@@ -1832,12 +1876,6 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
             content=user_content,
             metadata=user_metadata,
         )
-        logger.info(
-            "[DBG-CONV][WRITE] session_id=%s conversation_id=%s role=user content_len=%d",
-            session_id,
-            session["conversation_id"],
-            len(user_content or ""),
-        )
         if hasattr(db, "add_conversation_event"):
             try:
                 db.add_conversation_event(
@@ -1872,6 +1910,23 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
                 metadata={"mode": response.get("mode")},
             )
             cached_messages.append({"role": "assistant", "content": assistant_content})
+
+        # Live push: capture the conversation to Zoho as it grows so nothing
+        # is lost even if the (live) chat never ends with a goodbye. Idempotent
+        # upsert keyed on Conversation_ID, burst-coalesced, fire-and-forget.
+        try:
+            from src.integrations.zoho.conversation_push import push_conversation_to_zoho
+            push_conversation_to_zoho(
+                conversation_id=session["conversation_id"],
+                user_id=session.get("user_id"),
+                session_context=session.get("context") or {},
+                db=db,
+                background=True,
+                upsert=True,
+                force=False,
+            )
+        except Exception:
+            logger.warning("Zoho live conversation push skipped; continuing", exc_info=True)
 
         state_manager.update_session(session_id, {"recent_messages": cached_messages[-10:]})
 
@@ -3582,6 +3637,9 @@ async def startup_event():
         app.state.heartbeat_task = None
         logger.info("Service heartbeat emitter disabled")
 
+    app.state.zoho_flush_stop_event = asyncio.Event()
+    app.state.zoho_flush_task = asyncio.create_task(_zoho_flush_loop(app.state.zoho_flush_stop_event))
+
     # Build the BM25 keyword index if the processed chunks are present so hybrid
     # retrieval works even on hosts that start uvicorn directly (no startup script).
     try:
@@ -3608,3 +3666,10 @@ async def shutdown_event():
     if heartbeat_task is not None:
         with suppress(asyncio.CancelledError):
             await heartbeat_task
+    zoho_stop_event = getattr(app.state, "zoho_flush_stop_event", None)
+    zoho_flush_task = getattr(app.state, "zoho_flush_task", None)
+    if zoho_stop_event is not None:
+        zoho_stop_event.set()
+    if zoho_flush_task is not None:
+        with suppress(asyncio.CancelledError):
+            await zoho_flush_task

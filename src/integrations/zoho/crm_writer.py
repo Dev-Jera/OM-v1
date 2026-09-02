@@ -53,6 +53,8 @@ class ZohoCRMWriter:
             resp = self.session.request(method, url, headers=headers, **kwargs)
         if resp.status_code >= 400:
             raise ZohoCRMError(f"Zoho CRM {method} {url} failed: HTTP {resp.status_code}: {resp.text[:300]}")
+        if not getattr(resp, "text", "") and resp.status_code == 204:
+            return {}
         return resp.json()
 
     def create(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -124,6 +126,31 @@ class ZohoCRMWriter:
         if not candidates:
             return None
         return str(candidates[-1].get("id")) if candidates[-1].get("id") is not None else None
+
+    def upsert_by_key(self, records: List[Dict[str, Any]], key_field: str) -> Dict[str, Any]:
+        """Insert-or-update records keyed by a single business field.
+
+        Used by live conversation pushes so re-pushing the same
+        ``Conversation_ID`` (as the transcript grows) updates the existing
+        record instead of creating duplicates. Insert-only when the key field
+        is missing/empty.
+        """
+        responses: List[Dict[str, Any]] = []
+        for record in records:
+            key_value = record.get(key_field)
+            existing_id = None
+            if key_value not in (None, ""):
+                existing_id = self._find_existing(record, [key_field])
+            if existing_id is not None:
+                resp = self.update(existing_id, record)
+            else:
+                resp = self._request(
+                    "POST",
+                    f"{self.token_manager.api_base_url}/crm/v2/{self.module}",
+                    {"data": [record]},
+                )
+            responses.append(resp)
+        return {"data": responses}
 
     def upsert(self, records: List[Dict[str, Any]], duplicate_check_fields: List[str]) -> Dict[str, Any]:
         """Insert-or-update records keyed by the given unique fields.
