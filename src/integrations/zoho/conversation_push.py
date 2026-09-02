@@ -255,6 +255,13 @@ def push_conversation_to_zoho(
             db=db,
             conversation=conversation,
         )
+        logger.info(
+            "[DBG-CONV][BUILD] conversation_id=%s message_count=%s transcript_chars=%s module=%s",
+            conversation_id,
+            record.get("Message_Count"),
+            len(record.get("Transcript") or ""),
+            os.getenv("ZOHO_CONVERSATION_MODULE", DEFAULT_MODULE),
+        )
     except Exception:
         logger.exception("Failed to build Zoho conversation record; request continues unaffected")
         return False

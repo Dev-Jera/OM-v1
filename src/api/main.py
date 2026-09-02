@@ -1832,6 +1832,12 @@ async def _handle_chat_message(request: ChatMessage, router: ChatRouter, db: Pos
             content=user_content,
             metadata=user_metadata,
         )
+        logger.info(
+            "[DBG-CONV][WRITE] session_id=%s conversation_id=%s role=user content_len=%d",
+            session_id,
+            session["conversation_id"],
+            len(user_content or ""),
+        )
         if hasattr(db, "add_conversation_event"):
             try:
                 db.add_conversation_event(
