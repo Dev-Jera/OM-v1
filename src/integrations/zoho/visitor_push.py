@@ -2,7 +2,7 @@
 
 Whenever the bot captures a visitor's identity (name + email, and phone when
 available) through the chat identity flow or the /session/identify endpoint,
-this pushes one record into the ``MiaVisitor`` CRM module so every person who
+this pushes one record into the ``MiaVisitors`` CRM module so every person who
 interacts with the bot is visible in Zoho as a trackable visitor/lead.
 
 Privacy rules:
@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODULE = "MiaVisitor"
+DEFAULT_MODULE = "MiaVisitors"
 
 # The masked placeholder used in Zoho instead of a real personal name.
 VISITOR_NAME_MASK = ":clients_name"
@@ -54,7 +54,7 @@ def build_visitor_record(
     db: Any = None,
     conversation_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build the ``MiaVisitor`` record for the identity push.
+    """Build the ``MiaVisitors`` record for the identity push.
 
     The real ``name`` (if provided) is intentionally NOT stored in the record;
     only the masked placeholder is used. Email is the dedupe key. Anonymous
@@ -144,7 +144,7 @@ def push_visitor_to_zoho(
     conversation_count: Optional[int] = None,
     background: bool = True,
 ) -> bool:
-    """Push one visitor identity record into Zoho ``MiaVisitor``. Never raises.
+    """Push one visitor identity record into Zoho ``MiaVisitors``. Never raises.
 
     Returns True when a push was attempted (gate open + creds present).
     Anonymous visitors (no email/phone) are recorded too.

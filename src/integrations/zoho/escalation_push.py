@@ -1,7 +1,7 @@
 """Escalation handoff into Zoho CRM.
 
 When the bot escalates a conversation, this pushes one record into the
-``Mia_Escalations`` CRM module (reason, customer details, chat transcript)
+``MiaEscalations`` CRM module (reason, customer details, chat transcript)
 so Zoho-side agents are notified and take over — no one has to watch our
 admin dashboard.
 
@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODULE = "Mia_Escalations"
+DEFAULT_MODULE = "MiaEscalations"
 TRANSCRIPT_MESSAGE_LIMIT = 30
 TRANSCRIPT_MAX_CHARS = 30000
 

@@ -1,7 +1,7 @@
 """Complaint push into Zoho CRM.
 
 When a customer files a complaint, this pushes one record into the
-``Mia_Complaints`` CRM module so the support team is notified.
+``Mia_Complaint`` CRM module so the support team is notified.
 
 Design rules (same as escalation_push):
 - **Fire-and-forget**: runs in a background thread with full try/except.
@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODULE = "Mia_Complaints"
+DEFAULT_MODULE = "Mia_Complaint"
 
 
 def _enabled() -> bool:

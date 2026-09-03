@@ -1,7 +1,7 @@
 """Live conversation push into Zoho CRM.
 
 When a conversation ends, this pushes one record into the
-``Mia_Conversations`` CRM module so every chat is visible in Zoho
+``MiaConversations`` CRM module so every chat is visible in Zoho
 Analytics for dashboards, trends, and product popularity reports.
 
 Design rules (same as escalation_push / complaint_push):
@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODULE = "Mia_Conversations"
+DEFAULT_MODULE = "MiaConversations"
 TRANSCRIPT_MESSAGE_LIMIT = 30
 TRANSCRIPT_MAX_CHARS = 30000
 

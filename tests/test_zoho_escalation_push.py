@@ -82,7 +82,7 @@ def test_push_attempts_when_enabled_and_never_raises(monkeypatch, db_with_chat):
         raise RuntimeError("zoho down")
 
     monkeypatch.setattr(escalation_push, "_push_sync", fake_push_sync)
-    monkeypatch.setenv("ZOHO_ESCALATION_MODULE", "Mia_Escalations")
+    monkeypatch.setenv("ZOHO_ESCALATION_MODULE", "MiaEscalations")
 
     attempted = push_escalation_to_zoho(
         session_id="sess-3",
@@ -95,7 +95,7 @@ def test_push_attempts_when_enabled_and_never_raises(monkeypatch, db_with_chat):
 
     assert attempted is True
     assert len(pushed) == 1, "push attempted exactly once"
-    assert pushed[0][1] == "Mia_Escalations"
+    assert pushed[0][1] == "MiaEscalations"
     assert pushed[0][0]["Session_ID"] == "sess-3"
 
 
