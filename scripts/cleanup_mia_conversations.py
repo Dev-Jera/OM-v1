@@ -69,16 +69,21 @@ def _fetch_module_records(writer) -> list:
     return records
 
 
-def _build_db():
+def _build_db(database_url_override: str | None = None) -> tuple:
+    """Build the Postgres DB handle for the authoritative conversation-id lookup.
+
+    Returns ``(db, is_real)`` where ``is_real`` is True when a real (persistent)
+    Postgres connection is in use. The in-memory fallback DB is empty, so it must
+    never be treated as the authoritative source when deleting.
+    """
+    from src.database.postgres_real import PostgresDB as RealPostgresDB
     from src.utils.runtime_env import should_use_real_postgres
 
+    if database_url_override:
+        return RealPostgresDB(connection_string=database_url_override), True
     if should_use_real_postgres():
-        from src.database.postgres_real import PostgresDB
-
-        return PostgresDB(connection_string=os.environ["DATABASE_URL"])
-    from src.database.postgres import PostgresDB
-
-    return PostgresDB()
+        return RealPostgresDB(connection_string=os.environ["DATABASE_URL"]), True
+    return None, False
 
 
 def _writer():
@@ -105,6 +110,14 @@ def main() -> int:
         description="List / delete orphaned Zoho MiaConversations records"
     )
     parser.add_argument("--env", type=Path, default=None, help="Optional .env file (ZOHO_* / DATABASE_URL credentials)")
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="Explicit Postgres (Neon) URL for the authoritative conversation-id lookup. "
+        "Required for --delete, and recommended for list mode. Defaults to DATABASE_URL when "
+        "a real Postgres connection is configured.",
+    )
     parser.add_argument(
         "--list",
         action="store_true",
@@ -140,7 +153,20 @@ def main() -> int:
     if not args.delete and not args.list:
         args.list = True
 
-    db = _build_db()
+    db, is_real = _build_db(args.database_url)
+    if args.delete and not is_real:
+        log.error(
+            "Refusing to delete: no real Postgres connection (a real DB is required as the "
+            "authoritative conversation-id source). Pass --database-url <Neon URL> or run this "
+            "where the real DB is reachable (e.g. on the hosted service)."
+        )
+        return 1
+    if db is None:
+        log.error(
+            "No Postgres database configured. Pass --database-url <Neon URL> or set DATABASE_URL "
+            "with a real host (use_real_postgres)."
+        )
+        return 1
     try:
         known_ids = _all_conversation_ids(db)
     except RuntimeError as exc:
