@@ -175,10 +175,11 @@ class ChatRouter:
                     "message": response_text,
                     "flow": "journey",
                     "initial_data": self._build_initial_data_from_pending({"flow_type": flow_type}),
-                    "buttons": [
-                        {"label": "Yes, proceed", "action": "confirm_guided_switch"},
-                        {"label": "Not now", "action": "cancel_guided_switch"},
-                    ],
+                    # Zoho buttons disabled - no buttons used in Zoho.
+                    # "buttons": [
+                    #     {"label": "Yes, proceed", "action": "confirm_guided_switch"},
+                    #     {"label": "Not now", "action": "cancel_guided_switch"},
+                    # ],
                 },
             }
         # Default to conversational mode

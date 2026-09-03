@@ -123,7 +123,7 @@ async def test_brain_disabled_falls_back_to_legacy():
 
 
 @pytest.mark.asyncio
-async def test_quote_request_returns_guided_suggested_action_and_sets_pending():
+async def test_quote_request_returns_main_menu_redirect_no_buttons():
     db = PostgresDB()
     sm = StateManager(RedisCache(), db)
     session_id = make_session(sm)
@@ -133,10 +133,52 @@ async def test_quote_request_returns_guided_suggested_action_and_sets_pending():
     out = await conv.process("i want a travel insurance quotation", session_id, "1")
 
     assert out["intent"] == "quote"
-    assert out["suggested_action"]["type"] == "switch_to_guided"
-    assert out["suggested_action"]["initial_data"]["product_flow"] == "travel_insurance"
-    session = sm.get_session(session_id)
-    assert session["context"].get("pending_quote_offer") is True
+    # No crash, no buttons - plain main-menu redirect.
+    assert "main menu" in (out.get("response") or "").lower()
+    assert out.get("suggested_action") is None
+    assert out.get("show_handover_button") is False
+    assert "buttons" not in (out.get("suggested_action") or {})
+
+
+@pytest.mark.asyncio
+async def test_quote_request_presents_grounded_portal_link():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    brain = DummyBrain(result=SimpleResult(reply="ok", quote_requested=True, product="motor_private"))
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain)
+
+    out = await conv.process("i want to buy motor insurance", session_id, "1")
+
+    assert out["intent"] == "quote"
+    # Grounded motor portal link from the KB map should be present.
+    assert "oldmutual.co.ug" in (out.get("response") or "")
+    assert "main menu" in (out.get("response") or "").lower()
+    assert out.get("suggested_action") is None
+
+
+@pytest.mark.asyncio
+async def test_quote_request_falls_back_to_source_url_when_no_portal_match():
+    db = PostgresDB()
+    sm = StateManager(RedisCache(), db)
+    session_id = make_session(sm)
+    # travel_insurance has no PORTAL_LINKS entry, but a real URL in sources.
+    brain = DummyBrain(
+        result=SimpleResult(
+            reply="ok",
+            quote_requested=True,
+            product="travel_insurance",
+            sources=[{"url": "https://www.oldmutual.co.ug/travel"}],
+        )
+    )
+    conv = ConversationalMode(DummyRAG(), DummyMatcher(), sm, brain=brain)
+
+    out = await conv.process("i want a travel insurance quotation", session_id, "1")
+
+    assert out["intent"] == "quote"
+    assert "https://www.oldmutual.co.ug/travel" in (out.get("response") or "")
+    assert "main menu" in (out.get("response") or "").lower()
+    assert out.get("suggested_action") is None
 
 
 @pytest.mark.asyncio

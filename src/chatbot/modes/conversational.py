@@ -10,7 +10,7 @@ import time
 from src.utils.identity import extract_email, extract_name_from_email, is_valid_email
 
 from src.integrations.zoho.visitor_push import push_visitor_to_zoho
-from src.chatbot.sales_closing import build_buy_block, build_closing_block, extract_urls
+from src.chatbot.sales_closing import build_buy_block, build_closing_block, extract_urls, format_urls, resolve_buy_links
 from src.utils.manifest_loader import get_manifest, has_section
 
 logger = logging.getLogger(__name__)
@@ -266,6 +266,46 @@ _BUY_INTENT_TOKENS = (
     "want to get it",
     "get it sorted",
 )
+
+
+def _product_label_for_flow(flow_key: Optional[str]) -> Optional[str]:
+    """Map a brain quote flow key to a human product label for portal-link matching."""
+    if not flow_key:
+        return None
+    labels = {
+        "personal_accident": "Personal Accident",
+        "travel_insurance": "Travel Insurance",
+        "motor_private": "Motor Private",
+        "serenicare": "SereNicare",
+    }
+    return labels.get(flow_key, flow_key.replace("_", " ").title())
+
+
+def _build_quote_redirect_reply(
+    product_label: Optional[str] = None,
+    product_id: Optional[str] = None,
+    sources: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Main-menu redirect + grounded portal link(s) for a buy/quote intent.
+
+    Links come from the KB portal map (``resolve_buy_links``), falling back to
+    the product's own page URL pulled from the retrieved sources - never invented.
+    """
+    source_urls = extract_urls(sources, limit=3)
+    product_url = source_urls[0] if source_urls else None
+    links = resolve_buy_links(
+        product_label=product_label or None,
+        product_id=product_id or None,
+        product_url=product_url,
+    )
+    link_line = format_urls(links) if links else None
+
+    reply = "To apply, please navigate back to the main menu and follow the steps there."
+    if product_label:
+        reply = f"To apply for {product_label}, please navigate back to the main menu and follow the steps there."
+    if link_line:
+        reply += f" You can also start your application right here: {link_line}"
+    return reply
 
 
 def _has_buy_intent(message: str) -> bool:
@@ -1875,10 +1915,11 @@ class ConversationalMode:
                     "message": "Ready to get started? I can guide you through a few questions to provide a quote.",
                     "flow": "journey",
                     "initial_data": {"product_flow": digital_flow},
-                    "buttons": [
-                        {"label": "Get quotation", "action": "get_quotation"},
-                        {"label": "Not now", "action": "continue_chat"},
-                    ],
+                    # Zoho buttons disabled - no buttons used in Zoho.
+                    # "buttons": [
+                    #     {"label": "Get quotation", "action": "get_quotation"},
+                    #     {"label": "Not now", "action": "continue_chat"},
+                    # ],
                 }
             elif products:
                 top = products[0][2]
@@ -1887,20 +1928,22 @@ class ConversationalMode:
                     "message": f"{top.get('name', 'This product')} requires agent assistance. Please share your contact details.",
                     "flow": "agent_handoff",
                     "initial_data": {"product_name": top.get("name"), "product_url": top.get("url")},
-                    "buttons": [
-                        {"label": "Share details", "action": "start_guided"},
-                        {"label": "Not now", "action": "continue_chat"},
-                    ],
+                    # Zoho buttons disabled - no buttons used in Zoho.
+                    # "buttons": [
+                    #     {"label": "Share details", "action": "start_guided"},
+                    #     {"label": "Not now", "action": "continue_chat"},
+                    # ],
                 }
             else:
                 suggested_action = {
                     "type": "switch_to_guided",
                     "message": "Let me help you find the right solution. Please share your details.",
                     "flow": "agent_handoff",
-                    "buttons": [
-                        {"label": "Share details", "action": "start_guided"},
-                        {"label": "Not now", "action": "continue_chat"},
-                    ],
+                    # Zoho buttons disabled - no buttons used in Zoho.
+                    # "buttons": [
+                    #     {"label": "Share details", "action": "start_guided"},
+                    #     {"label": "Not now", "action": "continue_chat"},
+                    # ],
                 }
         elif intent == "discover" and products:
             suggested_action = {
@@ -1925,10 +1968,11 @@ class ConversationalMode:
                     "message": "If you'd like, I can walk you through an online quotation \u2014 it takes just a few minutes.",
                     "flow": "journey",
                     "initial_data": initial_data,
-                    "buttons": [
-                        {"label": "Get a quote", "action": "get_quotation"},
-                        {"label": "Not now", "action": "continue_chat"},
-                    ],
+                    # Zoho buttons disabled - no buttons used in Zoho.
+                    # "buttons": [
+                    #     {"label": "Get a quote", "action": "get_quotation"},
+                    #     {"label": "Not now", "action": "continue_chat"},
+                    # ],
                 }
 
         # No product-guide buttons by default; users can reply in free text.
@@ -2033,7 +2077,7 @@ class ConversationalMode:
                 product_flow = _detect_digital_flow(message) or topic.get("digital_flow")
                 return {
                     "mode": "conversational",
-                    "response": "Great! Click the button below to load the form and get your quotation.",
+                    "response": "To get started, please navigate back to the main menu and follow the steps there. No buttons required.",
                     "intent": "quote",
                     "intent_type": "INFORMATIONAL",
                     "confidence": 1.0,
@@ -2041,7 +2085,8 @@ class ConversationalMode:
                         "type": "switch_to_guided",
                         "flow": "journey",
                         "initial_data": {"product_flow": product_flow},
-                        "buttons": [{"label": "Get quotation", "action": "get_quotation"}],
+                        # Zoho buttons disabled - no buttons used in Zoho.
+                        # "buttons": [{"label": "Get quotation", "action": "get_quotation"}],
                     },
                 }
             if decision == "cancel":
@@ -2081,22 +2126,26 @@ class ConversationalMode:
         products_matched = [p[2]["name"] for p in self.product_matcher.match_products(message, top_k=3)]
         suggested_action = None
         intent = "general"
+        # MIA answers confidently and we do NOT auto-arm a human-agent handoff here.
+        # A handoff is only offered when the user asks for one or declines the
+        # completion question (handled elsewhere). Default to no handoff button so
+        # the quote_requested path never leaves this unbound.
+        show_handover_button = False
 
         if result.quote_requested:
             intent = "quote"
-            # Redirect to main menu instead of switching to guided flow
-            suggested_action = {
-                "type": "redirect_to_main_menu",
-                "message": "For quotes, please go to the main menu and click 'Get Quote' to follow the steps there."
-            }
-            # Don't set pending_quote_offer since we're not using guided flow
-            # Don't switch to guided mode - user will use main menu for quotes
+            # The LLM identifies the product (result.product); the reply redirects
+            # the user to the main menu and presents grounded portal link(s) for
+            # that product - no buttons.
+            response_text = _build_quote_redirect_reply(
+                product_label=_product_label_for_flow(result.product),
+                product_id=result.product,
+                sources=result.sources,
+            )
+            suggested_action = None
         else:
-            # MIA answers confidently and we do NOT auto-arm a human-agent handoff here.
-            # A handoff is only offered when the user asks for one or declines the
-            # completion question. Keep the "couldn't answer" signal for metrics so
-            # fallback_rate stays honest.
-            show_handover_button = False
+            # Keep the "couldn't answer" signal for metrics so fallback_rate stays honest.
+            response_text = result.reply
             if not result.sources or result.confidence < 0.2:
                 self._log_unanswered(
                     db,
@@ -2107,7 +2156,7 @@ class ConversationalMode:
 
         payload = {
             "mode": "conversational",
-            "response": result.reply,
+            "response": response_text,
             "sources": result.sources,
             "products_matched": products_matched,
             "intent": intent,
