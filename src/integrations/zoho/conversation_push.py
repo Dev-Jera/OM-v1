@@ -182,7 +182,11 @@ def build_conversation_record(
         "personal_accident": "personal",
         "serenicare": "personal",
     }
-    product_category = category_map.get(digital_flow, "general")
+    product_category = (
+        product_topic.get("category")
+        or category_map.get(digital_flow)
+        or "general"
+    )
 
     # User info from DB
     customer_name = ""

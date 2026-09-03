@@ -1589,6 +1589,7 @@ class ConversationalMode:
                 "name": topic_name,
                 "doc_id": topic_doc_id,
                 "url": topic_url,
+                "category": top_product.get("category_name") or "" if top_product else "",
             }
             if top_product:
                 ctx.pop("pending_product_choice", None)
@@ -2238,6 +2239,7 @@ class ConversationalMode:
             "name": product_name,
             "doc_id": product_id,
             "url": product.get("url"),
+            "category": product.get("category_name") or "",
         }
         self._maybe_log_product_interest(session_id, ctx)
         self.state_manager.update_session(session_id, {"context": ctx})
