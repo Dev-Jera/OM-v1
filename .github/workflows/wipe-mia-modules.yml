@@ -1,0 +1,42 @@
+name: Wipe Mia Modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      modules:
+        description: 'Modules to wipe (comma-separated). Leave default to wipe all six.'
+        required: false
+        default: 'MiaConversations,MiaEscalations,Mia_Complaint,Mia_Product_Logs,MiaVisitors,Mia_Bot_Metrics'
+
+jobs:
+  wipe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Delete all records from the selected Mia modules
+      env:
+        ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+        ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+        ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+        ZOHO_REGION: ${{ secrets.ZOHO_REGION }}
+      run: |
+        set -euo pipefail
+        required=(ZOHO_CLIENT_ID ZOHO_CLIENT_SECRET ZOHO_REFRESH_TOKEN)
+        for var in "${required[@]}"; do
+          if [ -z "${!var:-}" ]; then
+            echo "$var secret is required for the wipe" >&2
+            exit 1
+          fi
+        done
+        python scripts/wipe_mia_modules.py --delete --yes --module "${{ github.event.inputs.modules }}"
