@@ -2,7 +2,7 @@
 Conversational mode - RAG-powered free-form chat
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import logging
 import re
@@ -953,7 +953,7 @@ def _metric_payload(metric_type: str, value: float, conversation_id: Optional[st
 
 
 class ConversationalMode:
-    def __init__(self, rag_system, product_matcher, state_manager, brain=None, intent_router=None):
+    def __init__(self, rag_system, product_matcher, state_manager, brain=None, intent_router=None, product_classifier=None):
         self.rag = rag_system
         self.product_matcher = product_matcher
         self.state_manager = state_manager
@@ -962,6 +962,10 @@ class ConversationalMode:
         # Optional LLM-based intent router (LLM-first greeting vs OM-question).
         # Wired explicitly by the app; None keeps the legacy/brain fallback path.
         self.intent_router = intent_router
+
+        # Optional LLM-based product selector (replaces name-matching as the
+        # primary picker). None keeps the legacy ProductMatcher path.
+        self.product_classifier = product_classifier
 
         # Optional LLM-based small-talk responder.
         try:
@@ -1012,6 +1016,65 @@ class ConversationalMode:
             ctx["product_logged"] = True
         except Exception:
             pass
+
+    async def _llm_pick_product(self, message: str, products: List[Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """LLM-first product picker with matcher fallback.
+
+        Returns ``(product_dict, unmatched_raw)``:
+        - ``product_dict``: a catalog product chosen by the LLM classifier (or a
+          confident matcher skip), else None.
+        - ``unmatched_raw``: the raw product the user asked about that is NOT in
+          our catalog (so callers can log it as unmatched interest), else None.
+
+        Falls back so the bot never depends on the LLM being reachable.
+        """
+        classifier = getattr(self, "product_classifier", None)
+        if classifier is None or not classifier.available():
+            return None, None
+
+        # Skip the LLM when the matcher already has an unambiguous exact-name
+        # match (strong signal, well clear of the runner-up): no need to pay a
+        # second call for obvious cases.
+        if products:
+            top_score = float(products[0][0] or 0.0)
+            second_score = float(products[1][0] or 0.0) if len(products) > 1 else 0.0
+            if top_score >= 3.0 and top_score >= second_score + 1.0:
+                return products[0][2], None
+
+        names = sorted({p[2].get("name") or "" for p in products} | {p.get("name") or "" for p in self._catalog_products()})
+        names = [n for n in names if n]
+        if not names:
+            return None, None
+
+        try:
+            pick = await classifier.recognize(message, names)
+        except Exception as exc:
+            logger.warning("ProductClassifier failed; using matcher fallback: %s", exc)
+            return None, None
+
+        if not pick or not pick.name:
+            return None, None
+
+        if not pick.in_catalog:
+            # User asked for something we don't sell: capture it as unmatched.
+            return None, pick.name
+
+        # Resolve the validated name back to a catalog product dict.
+        for candidate in self._catalog_products():
+            if (candidate.get("name") or "") == pick.name:
+                return candidate, None
+        # Fall back to the matcher top pick for the same name if present.
+        for p in products:
+            if (p[2].get("name") or "") == pick.name:
+                return p[2], None
+        return None, None
+
+    def _catalog_products(self) -> List[Dict[str, Any]]:
+        """Return the full product catalog as a list of product dicts."""
+        index = getattr(self.product_matcher, "product_index", None)
+        if not isinstance(index, dict) or not index:
+            return []
+        return list(index.values())
 
     async def process(self, message: str, session_id: str, user_id: str, form_data: Optional[Dict[str, Any]] = None, db=None) -> Dict:
         """Process message in conversational mode"""
@@ -1267,15 +1330,30 @@ class ConversationalMode:
                 ctx = dict(session.get("context") or {})
 
                 picked = products[0][2] if products else None
+                # LLM-first: get the *meaning* right even here (e.g. "how much is
+                # a car insurance" -> Motor Insurance) instead of a token match.
+                llm_pick = None
+                llm_unmatched = None
+                if picked is not None:
+                    try:
+                        llm_pick, llm_unmatched = await self._llm_pick_product(message, products)
+                    except Exception as exc:
+                        logger.warning("ProductClassifier section pick failed; using matcher: %s", exc)
+                picked = llm_pick or picked
+                if llm_unmatched:
+                    # User asked for something we don't sell: log it separately so
+                    # Product_Name stays limited to real Old Mutual products.
+                    ctx["unmatched_interest"] = llm_unmatched
                 if picked:
                     ctx["product_topic"] = {
                         "digital_flow": _detect_digital_flow(message),
                         "name": picked.get("name"),
-                        "doc_id": picked.get("product_id"),
+                        "doc_id": picked.get("product_id") or picked.get("doc_id"),
                         "url": picked.get("url"),
+                        "category": picked.get("category_name") or "",
                     }
                     self._maybe_log_product_interest(session_id, ctx)
-                    self.state_manager.update_session(session_id, {"context": ctx})
+                self.state_manager.update_session(session_id, {"context": ctx})
 
                 # If we still don't know which product, ask a single clarifying question.
                 topic = (ctx.get("product_topic") or {}) if isinstance(ctx, dict) else {}
@@ -1406,6 +1484,19 @@ class ConversationalMode:
         # Match relevant products
         products = self.product_matcher.match_products(message, top_k=3)
 
+        # LLM-first product picker: gets the *meaning* right ("car insurance" ->
+        # Motor Insurance) instead of trusting a token match. Falls back to the
+        # matcher when the LLM is unavailable/uncertain or the match is already
+        # an unambiguous exact-name hit (skip).
+        llm_product: Optional[Dict[str, Any]] = None
+        llm_unmatched: Optional[str] = None
+        if not broad_query and intent != "compare":
+            try:
+                llm_product, llm_unmatched = await self._llm_pick_product(message, products)
+            except Exception as exc:  # never break the chat on classifier issues
+                logger.warning("ProductClassifier pick failed; using matcher: %s", exc)
+                llm_product, llm_unmatched = None, None
+
         session = self.state_manager.get_session(session_id) or {}
         ctx = dict(session.get("context") or {})
         topic = (ctx.get("product_topic") or {}) if isinstance(ctx, dict) else {}
@@ -1450,6 +1541,10 @@ class ConversationalMode:
             if intent == "compare":
                 # Comparing products: allow multiple doc_ids.
                 filters["products"] = [p[2]["product_id"] for p in products[:3]]
+            elif llm_product and llm_product.get("product_id") and not should_reuse_topic:
+                # LLM-selected product is authoritative for grounding: filter to it.
+                filters["products"] = [llm_product["product_id"]]
+                logger.info("[RAG] Applying LLM product filter: %s", llm_product.get("name"))
             elif should_reuse_topic and topic.get("doc_id"):
                 filters["products"] = [topic["doc_id"]]
                 logger.info("[RAG] Reusing session product topic filter: %s", topic["doc_id"])
@@ -1569,7 +1664,14 @@ class ConversationalMode:
 
         # Determine product topic for follow-up guidance.
         digital_flow = _detect_digital_flow(message) or topic.get("digital_flow")
-        top_product = None if broad_multi_product else (products[0][2] if products else (topic if topic.get("doc_id") else None))
+        llm_capture = (llm_product if not broad_multi_product else None)
+        if llm_unmatched:
+            # The LLM identified the request as something we DON'T sell: don't
+            # let a noisy matcher pick silently fill Product_Name. Keep a clear
+            # real match if one exists, else no product (-> "none" on push).
+            top_product = llm_capture or (None if broad_multi_product else (topic if topic.get("doc_id") else None))
+        else:
+            top_product = llm_capture if llm_capture else (None if broad_multi_product else (products[0][2] if products else (topic if topic.get("doc_id") else None)))
 
         if digital_flow or top_product:
             topic_name = None
@@ -1591,6 +1693,8 @@ class ConversationalMode:
                 "url": topic_url,
                 "category": top_product.get("category_name") or "" if top_product else "",
             }
+            if llm_unmatched:
+                ctx["unmatched_interest"] = llm_unmatched
             if top_product:
                 ctx.pop("pending_product_choice", None)
             if sources:
@@ -1603,6 +1707,8 @@ class ConversationalMode:
             # so a later wrap-up message can reference them.
             session = self.state_manager.get_session(session_id) or {}
             ctx = dict(session.get("context") or {})
+            if llm_unmatched:
+                ctx["unmatched_interest"] = llm_unmatched
             if sources:
                 ctx["last_urls"] = extract_urls(sources)
             _advance_sales_stage(ctx, intent, message, products)

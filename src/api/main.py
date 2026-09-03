@@ -60,6 +60,7 @@ from src.chatbot.state_manager import StateManager
 from src.chatbot.validation import FormValidationError
 from src.chatbot.brain import ConversationalBrain
 from src.chatbot.intent_classifier import IntentRouter
+from src.chatbot.product_classifier import ProductClassifier
 from src.rag.generate import (
     CANNOT_ANSWER_MESSAGE,
     ERROR_RETRY_MESSAGE,
@@ -491,12 +492,18 @@ conversational_brain = ConversationalBrain(retrieve_fn=rag_adapter.retrieve)
 # are answered strictly from retrieved chunks.
 conversational_intent_router = IntentRouter()
 
+# LLM-first product selector: resolves meaningful product mentions ("car
+# insurance" -> Motor Insurance) that word-matching misses, with matcher
+# fallback. Uses the same LLM_PROVIDER switch as the intent router.
+conversational_product_classifier = ProductClassifier()
+
 conversational_mode = ConversationalMode(
     rag_adapter,
     product_matcher,
     state_manager,
     brain=conversational_brain,
     intent_router=conversational_intent_router,
+    product_classifier=conversational_product_classifier,
 )
 guided_mode = GuidedMode(state_manager, product_matcher, postgres_db)
 chat_router = ChatRouter(conversational_mode, guided_mode, state_manager, product_matcher)

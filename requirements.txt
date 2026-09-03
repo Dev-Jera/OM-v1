@@ -28,7 +28,6 @@ unidecode==1.3.7
 # Embeddings & Vector stores
 openai==1.6.1
 sentence-transformers==3.3.1
-google-generativeai==0.8.3
 #pinecone-client==3.0.0
 qdrant-client==1.9.0
 

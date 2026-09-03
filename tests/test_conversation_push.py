@@ -140,7 +140,7 @@ def test_build_record_no_product():
         db=db,
         conversation=FakeConversation(),
     )
-    assert record["Product_Name"] == ""
+    assert record["Product_Name"] == "none"
     assert record["Product_Category"] == "general"
 
 
@@ -197,5 +197,33 @@ def test_build_record_empty_context():
         db=db,
         conversation=FakeConversation(),
     )
-    assert record["Product_Name"] == ""
+    assert record["Product_Name"] == "none"
     assert record["Outcome"] == "no_verdict"
+
+
+def test_build_record_unmatched_interest():
+    db = PostgresDB()
+    conv = db.create_conversation("u1", "conversational")
+    ctx = {"unmatched_interest": "health insurance"}
+    record = build_conversation_record(
+        conversation_id=conv.id,
+        user_id="u1",
+        session_context=ctx,
+        db=db,
+        conversation=FakeConversation(),
+    )
+    assert record["Unmatched_Interest"] == "health insurance"
+    assert record["Product_Name"] == "none"
+
+
+def test_build_record_unmatched_interest_empty_by_default():
+    db = PostgresDB()
+    conv = db.create_conversation("u1", "conversational")
+    record = build_conversation_record(
+        conversation_id=conv.id,
+        user_id="u1",
+        session_context={},
+        db=db,
+        conversation=FakeConversation(),
+    )
+    assert record["Unmatched_Interest"] == ""

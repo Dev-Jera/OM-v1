@@ -175,6 +175,12 @@ def build_conversation_record(
     # Product info from session context (read before Redis deletion)
     product_topic = (session_context or {}).get("product_topic") or {}
     product_name = product_topic.get("name") or ""
+    if not product_name:
+        # No product was identified during the chat: log an explicit "none"
+        # so the analytics dashboard can distinguish "no product" from a gap.
+        product_name = "none"
+    # Product the user asked about that Old Mutual does NOT sell (raw paraphrase).
+    unmatched_interest = (session_context or {}).get("unmatched_interest") or ""
     digital_flow = product_topic.get("digital_flow") or ""
     category_map = {
         "motor_private": "vehicle",
@@ -228,6 +234,7 @@ def build_conversation_record(
         "Zoho_Contact_Id": zoho_contact_id,
         "Product_Name": product_name,
         "Product_Category": product_category,
+        "Unmatched_Interest": unmatched_interest,
         "Outcome": outcome,
         "Mode": mode,
         "CSAT": csat if csat is not None else "",

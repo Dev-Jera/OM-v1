@@ -151,7 +151,7 @@ class OllamaEmbedder:
 @dataclass
 class GeminiEmbedder:
     """
-    Google Gemini embeddings via google-generativeai (AI Studio).
+    Google Gemini embeddings via google-genai (AI Studio).
 
     Requires env var with your API key, e.g. GEMINI_API_KEY.
     Use model "models/gemini-embedding-001" (text-embedding-004 is deprecated for embedContent).
@@ -166,13 +166,12 @@ class GeminiEmbedder:
     def __post_init__(self) -> None:
         import os
 
-        import google.generativeai as genai
+        from google import genai
 
         key = os.environ.get(self.api_key_env)
         if not key:
             raise RuntimeError(f"{self.api_key_env} is not set")
-        genai.configure(api_key=key)
-        self._genai = genai
+        self._client = genai.Client(api_key=key)
         self._dim: int | None = None
 
     @property
@@ -199,18 +198,21 @@ class GeminiEmbedder:
     def _embed_query_with_retry(self, text: str) -> List[float]:
         import time
 
+        from google.genai import types
+
         last_err = None
         for attempt in range(4):
             try:
-                kwargs = {
-                    "model": self.model,
-                    "content": text,
-                    "task_type": "retrieval_query",
-                }
-                # Default 1536 for pgvector ivfflat limit; explicitly pass to API
-                kwargs["output_dimensionality"] = 1536 if self.output_dimensionality is None else self.output_dimensionality
-                resp = self._genai.embed_content(**kwargs)
-                v = resp.get("embedding")
+                config = types.EmbedContentConfig(
+                    output_dimensionality=1536 if self.output_dimensionality is None else self.output_dimensionality,
+                    task_type="retrieval_query",
+                )
+                resp = self._client.models.embed_content(
+                    model=self.model,
+                    contents=text,
+                    config=config,
+                )
+                v = resp.embeddings[0].values
                 if not isinstance(v, list):
                     raise RuntimeError(f"Unexpected Gemini embedding response: {resp}")
                 if self._dim is None:
