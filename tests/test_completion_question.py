@@ -2,7 +2,6 @@ import pytest
 
 from src.chatbot.modes.conversational import (
     COMPLETION_ASK_PROMPT,
-    COMPLETION_RESOLVED_PROMPT,
     COMPLETION_UNRESOLVED_PROMPT,
     ConversationalMode,
 )
@@ -78,7 +77,10 @@ async def test_completion_yes_records_resolved_outcome():
     out = await conv.process("yes", session_id, str(user.id))
 
     assert out["outcome"] == "resolved"
-    assert out["response"] == COMPLETION_RESOLVED_PROMPT
+    r = out["response"]
+    assert r.count("Buy Now") >= 1 or "reset the chat" in r
+    assert "email this conversation" in r
+    assert "0800 132 700" in r
     events = _events(db, "completion_confirmed")
     assert len(events) == 1
     assert events[0].payload["outcome"] == "resolved"

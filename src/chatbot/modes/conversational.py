@@ -10,8 +10,16 @@ import time
 from src.utils.identity import extract_email, extract_name_from_email, is_valid_email
 
 from src.integrations.zoho.visitor_push import push_visitor_to_zoho
+from src.chatbot.sales_closing import build_buy_block, build_closing_block, extract_urls
+from src.utils.manifest_loader import get_manifest, has_section
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Sales journey stage tracking - a lightweight funnel (awareness -> interest ->
+# consideration -> decision) so MIA can nudge gently without nagging.
+# --------------------------------------------------------------------------- #
+SALES_STAGES = ("awareness", "interest", "consideration", "decision")
 
 
 def _time_greeting_eat() -> str:
@@ -213,6 +221,59 @@ def _looks_like_question(text: Optional[str]) -> bool:
     return len(t) > 70
 
 
+def _advance_sales_stage(ctx: Dict[str, Any], intent: str, message: str, products: List[Any]) -> str:
+    """Move the conversation forward through the sales funnel (never backwards).
+
+    Stages: awareness -> interest -> consideration -> decision.
+    """
+    current = ctx.get("sales_stage") or "awareness"
+    if current not in SALES_STAGES:
+        current = "awareness"
+    idx = SALES_STAGES.index(current)
+
+    message_lower = (message or "").lower()
+    wanted = None
+    if intent in ("quote", "buy"):
+        wanted = "decision"
+    elif any(w in message_lower for w in ["quote", "how much", "price", "cost", "premium", "eligibility", "apply", "buy"]):
+        wanted = "consideration"
+    elif products and intent in ("learn", "compare", "discover", "general"):
+        wanted = "interest"
+
+    if wanted and SALES_STAGES.index(wanted) > idx:
+        current = wanted
+        ctx["sales_stage"] = current
+    return current
+
+
+_BUY_INTENT_TOKENS = (
+    " buy",
+    "buying",
+    "purchase",
+    "purchasing",
+    " apply",
+    "applying",
+    "sign up",
+    "signing up",
+    "sign me up",
+    "get insurance",
+    "getting insurance",
+    "get covered",
+    "take up",
+    "take it up",
+    "start now",
+    "start today",
+    "want to get it",
+    "get it sorted",
+)
+
+
+def _has_buy_intent(message: str) -> bool:
+    """Heuristic for a direct buy/apply request (distinct from just learning)."""
+    m = f" {((message or '').strip()).lower()} "
+    return any(token in m for token in _BUY_INTENT_TOKENS)
+
+
 def _detect_section_intent(message: str) -> str | None:
     m = (message or "").lower()
     # Benefits
@@ -230,6 +291,29 @@ def _detect_section_intent(message: str) -> str | None:
     # Pricing
     if any(k in m for k in ["premium", "price", "pricing", "cost", "how much"]):
         return "show_pricing"
+    # Manage (top up, withdraw, monitor, access account) — checked before process
+    # because "how do i check my balance" should map to manage, not process.
+    if any(k in m for k in ["top up", "topup", "withdraw", "monitor", "access my", "check my", "login to", "log into"]):
+        return "manage"
+    # Process (apply, application, how to, what happens next)
+    if any(k in m for k in ["how do i apply", "how to apply", "application process", "what happens next", "step by step"]):
+        return "process"
+    # Contacts (who to call, email, phone)
+    if any(k in m for k in ["contact", "call", "phone", "email", "who do i", "reach", "toll free"]):
+        return "contacts"
+    # Links (portal, url, website)
+    if any(k in m for k in ["link", "portal", "url", "website", "where can i go"]):
+        return "links"
+    # Service channels (branches, locations, offices)
+    if any(k in m for k in ["branch", "office", "location", "where can i", "which branch"]):
+        return "service_channels"
+    # Scenarios — use very specific phrases only, not generic "what happens if" which
+    # matches too many normal questions. Only trigger for product-manage scenarios.
+    if any(k in m for k in ["scenario", "situation"]):
+        return "scenarios"
+    # Errors (mistake, wrong, problem) — use specific phrases only.
+    if any(k in m for k in ["i made a mistake", "wrong reference", "incorrect payment", "complaint about"]):
+        return "errors"
     return None
 
 
@@ -1508,7 +1592,19 @@ class ConversationalMode:
             }
             if top_product:
                 ctx.pop("pending_product_choice", None)
+            if sources:
+                ctx["last_urls"] = extract_urls(sources)
+            _advance_sales_stage(ctx, intent, message, products)
             self._maybe_log_product_interest(session_id, ctx)
+            self.state_manager.update_session(session_id, {"context": ctx})
+        elif sources or products:
+            # No single product topic, but still track the funnel + latest links
+            # so a later wrap-up message can reference them.
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            if sources:
+                ctx["last_urls"] = extract_urls(sources)
+            _advance_sales_stage(ctx, intent, message, products)
             self.state_manager.update_session(session_id, {"context": ctx})
 
         # Append a natural follow-up prompt when the user is learning about a product.
@@ -1576,6 +1672,91 @@ class ConversationalMode:
         elif related_products_block:
             answer_text = f"{answer_text}\n\n{related_products_block}" if answer_text else related_products_block
 
+        # Manifest honesty layer: if a specific section was requested but doesn't
+        # exist for this product, respond honestly instead of guessing.
+        if top_product:
+            _product_id_for_manifest = top_product.get("product_id") or top_product.get("doc_id")
+            # Strip the "website:product:" prefix if present (old doc_id format)
+            if _product_id_for_manifest and _product_id_for_manifest.startswith("website:product:"):
+                _product_id_for_manifest = _product_id_for_manifest.split(":", 2)[-1]
+            _manifest = get_manifest(_product_id_for_manifest) if _product_id_for_manifest else None
+            if _manifest:
+                _section_intent = _detect_section_intent(message)
+                # Map section intent names to manifest section keys
+                _section_key_map = {
+                    "show_benefits": "benefits",
+                    "show_coverage": "coverage",
+                    "show_exclusions": "exclusions",
+                    "show_eligibility": "eligibility",
+                    "show_pricing": "pricing",
+                    "process": "process",
+                    "manage": "manage",
+                    "contacts": "contacts",
+                    "links": "links",
+                    "service_channels": "service_channels",
+                    "scenarios": "scenarios",
+                    "errors": "errors",
+                }
+                _mapped_section = _section_key_map.get(_section_intent) if _section_intent else None
+                if _mapped_section and not has_section(_product_id_for_manifest, _mapped_section):
+                    _product_name = _manifest.get("product_name", "this product")
+                    answer_text = (
+                        f"We don't have {_mapped_section.replace('_', ' ')} information on file for {_product_name}. "
+                        "Would you like me to connect you with an agent who can help?"
+                    )
+                    suggested_action = None
+                    buy_block_shown = False
+                    # Skip to return — don't run buy block or suggested_action logic
+                    response_latency = time.time() - start_time
+                    metrics_to_emit.append(
+                        _metric_payload("response_latency", response_latency, conversation_id)
+                    )
+                    _emit_metrics(db, metrics_to_emit)
+                    if hasattr(db, "add_conversation_event"):
+                        try:
+                            db.add_conversation_event(
+                                conversation_id=conversation_id or session_id,
+                                event_type="intent",
+                                payload={
+                                    "intent": _section_intent or "section_not_found",
+                                    "intent_type": "INFORMATIONAL",
+                                    "confidence": 1.0,
+                                    "user_message": message,
+                                    "response_latency": response_latency,
+                                },
+                            )
+                        except Exception as exc:
+                            logger.warning("[metrics] Failed to record conversation event: %s", exc)
+                    return {
+                        "mode": "conversational",
+                        "response": answer_text,
+                        "sources": [],
+                        "products_matched": [],
+                        "intent": _section_intent or "section_not_found",
+                        "intent_type": "INFORMATIONAL",
+                        "suggested_action": None,
+                        "confidence": 1.0,
+                        "show_handover_button": False,
+                    }
+
+        # Direct buy/apply request: answer with the buy block (links, what-to-expect,
+        # email note, agent offer). Shown once per conversation.
+        buy_block_shown = False
+        if _has_buy_intent(message) and top_product:
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            if not ctx.get("buy_block_shown"):
+                ctx["buy_block_shown"] = True
+                buy_block_shown = True
+                self.state_manager.update_session(session_id, {"context": ctx})
+                buy_block = build_buy_block(
+                    product_label=top_product.get("name"),
+                    product_id=top_product.get("product_id") or top_product.get("doc_id"),
+                    product_url=top_product.get("url"),
+                )
+                if buy_block:
+                    answer_text = buy_block
+
         # Determine if we should suggest guided mode
         suggested_action = None
         if explicit_guided_intent:
@@ -1620,6 +1801,28 @@ class ConversationalMode:
                 "message": "Here are some products that might interest you:",
                 "products": [self._generate_product_card(p[2]) for p in products],
             }
+
+        # Gentle, once-per-conversation quote nudge when the user is close to deciding.
+        if suggested_action is None and top_product and not buy_block_shown:
+            session = self.state_manager.get_session(session_id) or {}
+            ctx = dict(session.get("context") or {})
+            if ctx.get("sales_stage") in ("consideration", "decision") and not ctx.get("quote_suggested"):
+                ctx["quote_suggested"] = True
+                self.state_manager.update_session(session_id, {"context": ctx})
+                initial_data = {"product_flow": digital_flow} if digital_flow else {
+                    "product_name": top_product.get("name"),
+                    "product_url": top_product.get("url"),
+                }
+                suggested_action = {
+                    "type": "switch_to_guided",
+                    "message": "If you'd like, I can walk you through an online quotation \u2014 it takes just a few minutes.",
+                    "flow": "journey",
+                    "initial_data": initial_data,
+                    "buttons": [
+                        {"label": "Get a quote", "action": "get_quotation"},
+                        {"label": "Not now", "action": "continue_chat"},
+                    ],
+                }
 
         # No product-guide buttons by default; users can reply in free text.
 
@@ -2352,6 +2555,14 @@ class ConversationalMode:
 
         if _is_affirmative(message):
             self.state_manager.update_session(session_id, {"context": ctx})
+
+            product_topic = ctx.get("product_topic") or {}
+            product_label = product_topic.get("name") or None
+            closing = build_closing_block(
+                urls=ctx.get("last_urls"),
+                product_label=product_label,
+            )
+
             self._record_completion(db, conversation_id, message, "resolved")
             try:
                 self.state_manager.end_session(session_id, ended_by="bot")
@@ -2359,7 +2570,7 @@ class ConversationalMode:
                 pass
             return {
                 "mode": "conversational",
-                "response": COMPLETION_RESOLVED_PROMPT,
+                "response": closing,
                 "confidence": 1.0,
                 "outcome": "resolved",
             }
