@@ -7,7 +7,7 @@ pyyaml==6.0.1
 fastapi==0.121.3
 uvicorn[standard]==0.27.0
 # Test client dependency
-httpx==0.27.2
+httpx==0.28.1
 
 # Web scraping
 requests==2.33.0
