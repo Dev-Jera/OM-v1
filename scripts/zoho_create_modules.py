@@ -3,7 +3,15 @@
 
 Creates (idempotently):
   - Mia_Bot_Metrics   : one record per day of Bot Impact KPIs
-  - Mia_Escalations   : one record per bot escalation (transcript included)
+  - MiaEscalations    : one record per bot escalation (transcript included)
+  - Mia_Complaint     : one record per customer complaint
+  - Mia_Product_Logs  : one record per product mentioned in a chat
+  - MiaConversations  : one record per bot conversation (transcript included)
+  - MiaVisitors       : one record per tracked visitor
+
+Module API names here intentionally match the runtime values read from the
+environment (ZOHO_*_MODULE) so a module never gets created under a different,
+wrong name than the pushes target.
 
 Requires a refresh token whose consent included ZohoCRM.settings.modules.CREATE
 (re-run scripts/zoho_oauth_setup.py --env .env --write after any scope change).
@@ -50,7 +58,7 @@ METRICS_MODULE = {
 }
 
 ESCALATIONS_MODULE = {
-    "module_name": "Mia_Escalations",
+    "module_name": "MiaEscalations",
     "singular_label": "Mia Escalation",
     "plural_label": "Mia Escalations",
     "fields": [
@@ -76,7 +84,7 @@ ESCALATIONS_MODULE = {
 }
 
 COMPLAINTS_MODULE = {
-    "module_name": "Mia_Complaints",
+    "module_name": "Mia_Complaint",
     "singular_label": "Mia Complaint",
     "plural_label": "Mia Complaints",
     "fields": [
@@ -115,7 +123,7 @@ PRODUCT_LOGS_MODULE = {
 }
 
 CONVERSATIONS_MODULE = {
-    "module_name": "Mia_Conversations",
+    "module_name": "MiaConversations",
     "singular_label": "Mia Conversation",
     "plural_label": "Mia Conversations",
     "fields": [
@@ -147,6 +155,22 @@ CONVERSATIONS_MODULE = {
     ],
 }
 
+VISITORS_MODULE = {
+    "module_name": "MiaVisitors",
+    "singular_label": "Mia Visitor",
+    "plural_label": "Mia Visitors",
+    "fields": [
+        {"field_label": "Name", "data_type": "text", "length": 255},
+        {"field_label": "Email", "data_type": "email", "length": 200},
+        {"field_label": "Phone", "data_type": "phone", "length": 32},
+        {"field_label": "User ID", "data_type": "text", "length": 128},
+        {"field_label": "Source", "data_type": "text", "length": 64},
+        {"field_label": "First Seen At", "data_type": "datetime", "length": 20},
+        {"field_label": "Last Seen At", "data_type": "datetime", "length": 20},
+        {"field_label": "Conversation Count", "data_type": "integer", "length": 16},
+    ],
+}
+
 # CRM field API names are derived from labels (spaces -> underscores).
 # These are the names the push code writes to.
 FIELD_API_NAMES = {
@@ -156,11 +180,11 @@ FIELD_API_NAMES = {
         "Bot_Down_Rate", "Off_Hours_Rate",
         "Repeat_User_Rate", "CSAT", "Avg_Latency_Seconds", "Effort_Hours_Saved",
     ],
-    "Mia_Escalations": [
+    "MiaEscalations": [
         "Name", "Escalated_At", "Conversation_ID", "Session_ID", "Reason", "Customer_Name",
         "Phone", "Zoho_Contact_Id", "Transcript", "Status",
     ],
-    "Mia_Complaints": [
+    "Mia_Complaint": [
         "Name", "Customer_Name", "Email", "Category", "Complaint",
         "Submitted_At", "Status",
     ],
@@ -168,11 +192,15 @@ FIELD_API_NAMES = {
         "Name", "Conversation_ID", "User_ID", "Product_Name",
         "Product_Category", "Logged_At",
     ],
-    "Mia_Conversations": [
+    "MiaConversations": [
         "Name", "Conversation_ID", "User_ID", "Customer_Name", "Phone",
         "Zoho_Contact_Id", "Product_Name", "Product_Category", "Outcome",
         "Mode", "CSAT", "Message_Count", "Duration_Seconds",
         "Started_At", "Ended_At", "Transcript",
+    ],
+    "MiaVisitors": [
+        "Name", "Email", "Phone", "User_ID", "Source",
+        "First_Seen_At", "Last_Seen_At", "Conversation_Count",
     ],
 }
 
@@ -180,7 +208,7 @@ FIELD_API_NAMES = {
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create Mia_Bot_Metrics and Mia_Escalations modules in Zoho CRM")
     parser.add_argument("--env", type=Path, default=None, help=".env file with ZOHO_* credentials")
-    parser.add_argument("--only", choices=["metrics", "escalations", "complaints", "product-logs", "conversations"], default=None, help="Create only one of the modules")
+    parser.add_argument("--only", choices=["metrics", "escalations", "complaints", "product-logs", "conversations", "visitors"], default=None, help="Create only one of the modules")
     args = parser.parse_args()
 
     if args.env:
@@ -214,6 +242,8 @@ def main() -> int:
         modules.append(PRODUCT_LOGS_MODULE)
     if args.only in (None, "conversations"):
         modules.append(CONVERSATIONS_MODULE)
+    if args.only in (None, "visitors"):
+        modules.append(VISITORS_MODULE)
 
     failures = 0
     for module in modules:

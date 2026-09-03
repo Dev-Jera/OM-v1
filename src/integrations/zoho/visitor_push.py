@@ -57,9 +57,9 @@ def build_visitor_record(
     """Build the ``MiaVisitor`` record for the identity push.
 
     The real ``name`` (if provided) is intentionally NOT stored in the record;
-    only the masked placeholder is used. Email is the dedupe key.
-    Returns ``None`` when there is no usable key (no email and no user to look
-    up a phone from), so we never push an empty/identifying record.
+    only the masked placeholder is used. Email is the dedupe key. Anonymous
+    visitors (no email and no phone) are still recorded so visitor volume shows
+    up in dashboards; they simply use the ``create`` path since there is no key.
     """
     email = (email or "").strip().lower() or None
     phone = (phone or "").strip() or None
@@ -87,11 +87,6 @@ def build_visitor_record(
         "Last_Seen_At": now,
         "Conversation_Count": int(conversation_count or 0),
     }
-
-    if not email and not phone:
-        # Nothing to identify the visitor by - do not push a blank record.
-        logger.info("Visitor push skipped: no email or phone available for user %s", user_id)
-        return None
 
     return record
 
@@ -151,8 +146,8 @@ def push_visitor_to_zoho(
 ) -> bool:
     """Push one visitor identity record into Zoho ``MiaVisitor``. Never raises.
 
-    Returns True when a push was attempted (gate open + creds present + a
-    usable email/phone key exists).
+    Returns True when a push was attempted (gate open + creds present).
+    Anonymous visitors (no email/phone) are recorded too.
     """
     if not _enabled():
         return False

@@ -21,7 +21,7 @@ def test_metrics_module_definition_is_well_formed():
 
 
 def test_escalations_module_definition_is_well_formed():
-    assert ESCALATIONS_MODULE["module_name"] == "Mia_Escalations"
+    assert ESCALATIONS_MODULE["module_name"] == "MiaEscalations"
     labels = [f["field_label"] for f in ESCALATIONS_MODULE["fields"]]
     assert len(labels) == len(set(labels))
     for field in ESCALATIONS_MODULE["fields"]:
@@ -54,5 +54,5 @@ def test_escalation_fields_cover_everything_push_writes():
     from src.integrations.zoho.escalation_push import build_escalation_record
 
     record = build_escalation_record(session_id="s", reason="r", user_id=None, metadata=None, db=None)
-    expected = FIELD_API_NAMES["Mia_Escalations"]
+    expected = FIELD_API_NAMES["MiaEscalations"]
     assert sorted(record.keys()) == sorted(expected)

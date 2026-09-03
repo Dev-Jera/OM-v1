@@ -1,0 +1,41 @@
+name: Zoho Metrics Push
+
+on:
+  schedule:
+    - cron: '0 15 * * *'  # Daily at 15:00 UTC = 18:00 Kampala
+  workflow_dispatch:
+
+jobs:
+  metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Push daily Bot Impact KPIs to Zoho Mia_Bot_Metrics
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+        ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+        ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+        ZOHO_REGION: ${{ secrets.ZOHO_REGION }}
+        ZOHO_METRICS_MODULE: Mia_Bot_Metrics
+      run: |
+        set -euo pipefail
+        required=(DATABASE_URL ZOHO_CLIENT_ID ZOHO_CLIENT_SECRET ZOHO_REFRESH_TOKEN)
+        for var in "${required[@]}"; do
+          if [ -z "${!var:-}" ]; then
+            echo "$var secret is required for the metrics push" >&2
+            exit 1
+          fi
+        done
+        python scripts/run_zoho_metrics_push.py --period daily

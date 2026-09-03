@@ -62,9 +62,15 @@ def test_build_visitor_record_masks_real_name():
     assert rec["User_ID"] == "u1"
 
 
-def test_build_visitor_record_skips_without_email_or_phone():
+def test_build_visitor_record_records_anonymous_without_email_or_phone():
     rec = build_visitor_record(user_id="u1", email=None, phone=None)
-    assert rec is None
+    assert rec is not None
+    # Anonymous visitors are recorded so visitor volume shows in dashboards.
+    assert rec["Email"] == ""
+    assert rec["Phone"] == ""
+    assert rec["User_ID"] == "u1"
+    assert rec["Source"] == "chat"
+    assert rec["Name"].startswith(VISITOR_NAME_MASK)
 
 
 def test_build_visitor_name_is_stable_for_same_email():
@@ -87,5 +93,6 @@ def test_push_disabled_gate_returns_false():
     assert push_visitor_to_zoho(user_id="u1", email="a@b.com") is False
 
 
-def test_push_no_key_returns_false():
-    assert push_visitor_to_zoho(user_id="u1", email=None, phone=None) is False
+def test_push_anonymous_returns_true():
+    # Anonymous visitors (no email/phone) are now recorded; a push is attempted.
+    assert push_visitor_to_zoho(user_id="u1", email=None, phone=None) is True

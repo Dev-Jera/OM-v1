@@ -1,4 +1,4 @@
-"""Thin Zoho CRM write client (create / upsert).
+"""Thin Zoho CRM write client (create / update / upsert / delete).
 
 Counterpart to the read-only collector: used by the daily KPI push and the
 escalation handoff. Reuses the shared token manager and the same 401-retry
@@ -66,6 +66,24 @@ class ZohoCRMWriter:
         """Update one existing record by id. Returns the raw CRM response."""
         url = f"{self.token_manager.api_base_url}/crm/v2/{self.module}/{record_id}"
         return self._request("PUT", url, {"data": [data]})
+
+    def delete(self, record_ids: List[str]) -> Dict[str, Any]:
+        """Delete records by id.
+
+        Zoho moves deleted records to the recycle bin (recoverable). Zoho's
+        DELETE endpoint accepts at most 100 ids per call, so larger batches are
+        chunked. Returns the last CRM response (an empty dict when a call
+        returns 204).
+        """
+        ids = [str(i) for i in record_ids if str(i).strip()]
+        if not ids:
+            return {}
+        response: Dict[str, Any] = {}
+        for start in range(0, len(ids), 100):
+            chunk = ids[start : start + 100]
+            url = f"{self.token_manager.api_base_url}/crm/v2/{self.module}"
+            response = self._request("DELETE", url, params={"ids": ",".join(chunk)})
+        return response
 
     @staticmethod
     def _key_fields(record: Dict[str, Any], duplicate_check_fields: List[str]) -> List[str]:
