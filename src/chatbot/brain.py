@@ -401,6 +401,50 @@ class ConversationalBrain:
 
     # -- internal plumbing ---------------------------------------------------
 
+    @staticmethod
+    def _log_gemini_response(response: Any) -> None:
+        """Log the decisive fields of a Gemini response so a failure is self-diagnosing.
+
+        Distinguishes: 429/quota (raised before a response), an empty ``.text`` with
+        non-text parts (function_call / thought / safety block), a token-limit cut-off,
+        or a genuinely empty reply. Never logs PII - only structural metadata.
+        """
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            for i, cand in enumerate(candidates):
+                fr = getattr(cand, "finish_reason", None)
+                fr_val = getattr(fr, "value", fr)
+                br = getattr(cand, "block_reason", None)
+                br_val = getattr(br, "value", br)
+                safety = getattr(cand, "safety_ratings", None) or []
+                parts = []
+                content = getattr(cand, "content", None)
+                for part in (getattr(content, "parts", None) or []):
+                    if getattr(part, "function_call", None) is not None:
+                        parts.append("function_call")
+                    elif isinstance(getattr(part, "thought", None), bool):
+                        parts.append("thought")
+                    elif isinstance(getattr(part, "text", None), str):
+                        parts.append("text")
+                    else:
+                        parts.append("other")
+                logger.warning(
+                    "Gemini response diagnostic candidate=%s finish_reason=%s block_reason=%s "
+                    "parts=%s safety_ratings=%d",
+                    i,
+                    fr_val,
+                    br_val,
+                    parts,
+                    len(safety),
+                )
+            if not candidates:
+                logger.warning(
+                    "Gemini response diagnostic: no candidates. response=%s",
+                    type(response).__name__,
+                )
+        except Exception:
+            logger.debug("Could not log Gemini response diagnostic", exc_info=True)
+
     async def _call_llm(self, contents: List[Dict[str, Any]], config: Any) -> Any:
         if self.llm is not None:
             return await self.llm(contents, config)
@@ -415,7 +459,20 @@ class ConversationalBrain:
                 config=types.GenerateContentConfig(**config) if isinstance(config, dict) else config,
             )
 
-        return await asyncio.to_thread(_sync)
+        try:
+            response = await asyncio.to_thread(_sync)
+        except Exception as exc:
+            logger.error(
+                "Brain LLM call failed (%s): %s",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+        # Log the decisive fields so an empty/failed reply is self-diagnosing
+        # (e.g. a 429/quota, a safety block, or a non-text-only response).
+        self._log_gemini_response(response)
+        return response
 
     async def _retrieve(self, query: str) -> List[Dict[str, Any]]:
         if self.retrieve_fn is None:
@@ -504,7 +561,28 @@ class ConversationalBrain:
                 if not calls:
                     text = _response_text(response)
                     if not text:
-                        logger.warning("Brain returned empty reply")
+                        # Diagnostic already logged by _call_llm; add summary here
+                        # so the "empty reply" line is self-diagnosing.
+                        try:
+                            candidates = getattr(response, "candidates", None) or []
+                            fr = getattr(candidates[0], "finish_reason", None) if candidates else None
+                            br = getattr(candidates[0], "block_reason", None) if candidates else None
+                            fr_val = getattr(fr, "value", fr) if fr else None
+                            br_val = getattr(br, "value", br) if br else None
+                            parts = [
+                                "function_call" if getattr(part, "function_call", None) is not None
+                                else ("thought" if isinstance(getattr(part, "thought", None), bool) else "text")
+                                for part in (getattr(getattr(candidates[0], "content", None), "parts", None) or []) if candidates
+                            ]
+                        except Exception:
+                            fr_val = br_val = parts = "?"
+                        logger.warning(
+                            "Brain returned empty reply (finish_reason=%s block_reason=%s parts=%s response_type=%s)",
+                            fr_val,
+                            br_val,
+                            parts,
+                            type(response).__name__,
+                        )
                         return None
                     text = await self._ensure_complete(response, contents, config, text)
                     text = strip_meta_lead_in(text)
